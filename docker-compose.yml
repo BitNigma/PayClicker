@@ -1,0 +1,16 @@
+services:
+  order-bot:
+    build: .
+    container_name: order-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      STORAGE_STATE_PATH: /data/auth.json
+      LOG_PATH: /data/actions.log
+      HEADLESS: "false"   # в контейнере браузер идёт через Xvfb
+    volumes:
+      # тут будут храниться сохранённая сессия (auth.json) и лог файл
+      - ./data:/data
+    # shm нужен браузеру, дефолтных 64MB часто не хватает -> краши Chromium
+    shm_size: "1gb"
