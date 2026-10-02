@@ -53,12 +53,18 @@ async def main():
             except Exception:
                 logger.exception("Failed to send telegram document to %s", chat_id)
 
+    # Браузерный воркер (WORKER_BACKEND=browser, «безопасный откат») поднимает
+    # отдельный Chromium на кабинет и использует общие data-пути, поэтому в
+    # мультиаккаунте запускаем им только первый кабинет. Для нескольких
+    # кабинетов сразу — WORKER_BACKEND=http (по умолчанию).
+    accounts = cfg.accounts
     if backend == "browser" and len(cfg.accounts) > 1:
         logger.warning(
-            "WORKER_BACKEND=browser поддерживает только кабинет #1; для %d кабинетов "
-            "используйте WORKER_BACKEND=http",
-            len(cfg.accounts),
+            "WORKER_BACKEND=browser поддерживает только кабинет #1: запускаю лишь «%s». "
+            "Для одновременной работы нескольких кабинетов используйте WORKER_BACKEND=http",
+            cfg.accounts[0].name,
         )
+        accounts = cfg.accounts[:1]
 
     async with application:
         await application.start()
@@ -68,7 +74,7 @@ async def main():
         # Свой воркер на каждый кабинет: задача живёт постоянно и ждёт,
         # пока бот не выставит ws.running=True (команда /run + выбор кабинета).
         worker_tasks = []
-        for account in cfg.accounts:
+        for account in accounts:
             ws = state.ensure(account.index, account.name)
             worker_tasks.append(
                 asyncio.create_task(
@@ -79,7 +85,7 @@ async def main():
         logger.info(
             "Started %d worker task(s): %s",
             len(worker_tasks),
-            [f"{a.index}:{a.name}" for a in cfg.accounts],
+            [f"{a.index}:{a.name}" for a in accounts],
         )
 
         try:

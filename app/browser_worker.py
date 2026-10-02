@@ -86,6 +86,20 @@ def _log_action(cfg: Config, order_id: str, action: str):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+# Авторизация кабинета поднимает отдельный Chromium и может требовать ручного
+# ввода 2FA, поэтому при мультиаккаунте запускаем их строго по одной.
+_LOGIN_LOCK: asyncio.Lock | None = None
+
+
+def _login_lock() -> asyncio.Lock:
+    """Ленивое создание блокировки: она должна рождаться внутри работающего
+    event loop, иначе на некоторых версиях Python будет «no current event loop»."""
+    global _LOGIN_LOCK
+    if _LOGIN_LOCK is None:
+        _LOGIN_LOCK = asyncio.Lock()
+    return _LOGIN_LOCK
+
+
 async def _build_context(pw, cfg: Config, account) -> BrowserContext:
     browser = await pw.chromium.launch(
         headless=cfg.headless,
@@ -186,7 +200,20 @@ async def login_via_browser(cfg: Config, account, ws, notify) -> bool:
     """Разовая браузерная авторизация (в т.ч. 2FA) — нужна ТОЛЬКО чтобы получить
     и обновить cookies кабинета в его storage_state_path для HTTP-горячего цикла
     (http_worker). Сам горячий цикл браузер не использует.
+
+    При мультиаккаунте авторизации идут строго по одной (см. _login_lock):
+    параллельные Chromium'ы с ручным вводом 2FA путали бы, какой код чей,
+    и съедали RAM.
     """
+    lock = _login_lock()
+    if lock.locked():
+        await notify("⏳ Другой кабинет сейчас авторизуется — жду своей очереди...")
+    async with lock:
+        return await _login_via_browser_locked(cfg, account, ws, notify)
+
+
+async def _login_via_browser_locked(cfg: Config, account, ws, notify) -> bool:
+    """Сама авторизация; вызывать только под _login_lock()."""
     async with async_playwright() as pw:
         browser, context = await _build_context(pw, cfg, account)
         try:

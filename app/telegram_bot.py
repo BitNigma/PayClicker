@@ -52,52 +52,133 @@ def _accounts_list(cfg: Config) -> str:
 
 
 async def _ask_account(update: Update, cfg: Config, action: str, verb: str) -> None:
-    """Кладёт диалог «какой кабинет?» в chat_pending и просит прислать номер."""
+    """Кладёт диалог «какой кабинет?» в chat_pending и просит прислать номера."""
     state.chat_pending[update.effective_chat.id] = {"action": action, "step": "choose_account"}
     await update.message.reply_text(
-        f"Какой кабинет {verb}?\n{_accounts_list(cfg)}\n\nПришлите номер цифрами (например: 1)."
+        f"Какой кабинет {verb}?\n{_accounts_list(cfg)}\n\n"
+        "Пришлите номер цифрами (например: 1), несколько номеров через пробел (1 3) "
+        "или all — тогда действие применится ко всем кабинетам сразу."
     )
+
+
+# Слова, означающие «все кабинеты» (в диалоге и в аргументах команд).
+_ALL_WORDS = {"all", "все", "всё", "*"}
+
+# Заголовки сводки для действий сразу по нескольким кабинетам.
+_ACTION_TITLES = {
+    "run": "▶️ Запускаю на взятие заявок",
+    "watch": "👀 Включаю наблюдение",
+    "stop": "⏹ Останавливаю",
+    "start": "🚀 Запускаю",
+}
+
+
+def _parse_account_indices(text: str, cfg: Config) -> list:
+    """Разбирает выбор кабинетов: '2' -> [2], '1 3' / '1,3' -> [1, 3],
+    'all'/'все' -> номера всех кабинетов. Непонятный ввод -> [] (пустой список)."""
+    cleaned = (text or "").strip().lower()
+    if cleaned in _ALL_WORDS:
+        return [a.index for a in cfg.accounts]
+    known = {a.index for a in cfg.accounts}
+    chosen = []
+    for token in re.split(r"[\s,;/]+", cleaned):
+        if not token:
+            continue
+        if not re.fullmatch(r"\d{1,3}", token):
+            return []
+        index = int(token)
+        if index not in known or index in chosen:
+            return []  # неизвестный/повторяющийся номер — не угадываем
+        chosen.append(index)
+    return chosen
 
 
 def _parse_account_index(text: str, cfg: Config) -> int | None:
     """'2' -> 2, если кабинет с таким номером есть; иначе None."""
-    if not re.fullmatch(r"\d{1,3}", text):
-        return None
-    idx = int(text)
-    return idx if any(a.index == idx for a in cfg.accounts) else None
+    indices = _parse_account_indices(text, cfg)
+    return indices[0] if len(indices) == 1 else None
 
 
-async def _apply_account_action(update: Update, cfg: Config, action: str, index: int) -> None:
-    """Запускает/останавливает выбранный кабинет."""
-    account = next(a for a in cfg.accounts if a.index == index)
-    ws = state.ensure(account.index, account.name)
+def _cmd_args(context) -> list:
+    """Аргументы команды (/run 1 2 -> ['1', '2']). context в тестах может быть None."""
+    args = getattr(context, "args", None) or []
+    return [str(a) for a in args if str(a).strip()]
 
-    if action == "stop":
-        ws.running = False
-        await update.message.reply_text(f"⏹ Кабинет «{ws.name}» остановлен.")
-        return
 
-    if action == "watch":
-        ws.mode = "watch"
-    elif action == "run":
-        ws.mode = "take"
-    # action == "start" — режим не меняем, только запускаем
+async def _apply_account_action(update: Update, cfg: Config, action: str, index) -> None:
+    """Запускает/останавливает один кабинет (номер) или сразу несколько (список).
 
-    already = ws.running
-    ws.running = True
-    if already:
-        await update.message.reply_text(f"ℹ️ Кабинет «{ws.name}» уже работал — продолжаю (режим {ws.mode}).")
-    elif ws.logged_in:
-        await update.message.reply_text(f"▶️ Кабинет «{ws.name}»: режим {ws.mode} запущен.")
-    else:
-        await update.message.reply_text(
-            f"🚀 Кабинет «{ws.name}»: запускаю авторизацию, мониторинг стартует сразу после. "
-            "Если понадобится код 2FA — пришлите его сюда."
+    Отвечает одной сводкой: по строке на кабинет, чтобы при массовом запуске
+    было видно, что именно произошло с каждым.
+    """
+    indices = [index] if isinstance(index, int) else list(index)
+    lines = []
+    need_login = []
+    for i in indices:
+        account = next((a for a in cfg.accounts if a.index == i), None)
+        if account is None:
+            continue
+        ws = state.ensure(account.index, account.name)
+
+        if action == "stop":
+            ws.running = False
+            lines.append(f"⏹ Кабинет «{ws.name}» остановлен.")
+            continue
+
+        if action == "watch":
+            ws.mode = "watch"
+        elif action == "run":
+            ws.mode = "take"
+        # action == "start" — режим не меняем, только запускаем
+
+        already = ws.running
+        ws.running = True
+        if already:
+            lines.append(f"ℹ️ Кабинет «{ws.name}» уже работал — продолжаю (режим {ws.mode}).")
+        elif ws.logged_in:
+            lines.append(f"▶️ Кабинет «{ws.name}»: режим {ws.mode} запущен.")
+        else:
+            need_login.append(ws.name)
+            lines.append(f"🚀 Кабинет «{ws.name}»: запускаю авторизацию, мониторинг стартует сразу после.")
+
+    if len(indices) > 1:
+        lines.insert(0, f"{_ACTION_TITLES.get(action, action)} — кабинетов: {len(indices)}")
+
+    if need_login:
+        lines.append(
+            "Если понадобится код 2FA — пришлите его сюда. Когда кода ждут несколько "
+            "кабинетов, укажите номер и код через пробел (например: 2 123456)."
         )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _apply_command_args(update: Update, cfg: Config, action: str, context) -> bool:
+    """Применяет действие к кабинетам, перечисленным прямо в команде
+    (/run 1 3, /stop all). Возвращает True, если аргументы были и мы ответили,
+    и False — если аргументов нет и нужен диалог выбора кабинета."""
+    args = _cmd_args(context)
+    if not args:
+        return False
+    indices = _parse_account_indices(" ".join(args), cfg)
+    if not indices:
+        await update.message.reply_text(
+            f"Не понял номера кабинетов: {' '.join(args)}\n{_accounts_list(cfg)}\n\n"
+            "Укажите номера через пробел (например: 1 3) или all — все кабинеты."
+        )
+        return True
+    await _apply_account_action(update, cfg, action, indices)
+    return True
+
+
+async def _all_accounts_action(update: Update, cfg: Config, action: str) -> None:
+    """Действие сразу по всем кабинетам — для команд /runall, /stopall, /watchall."""
+    await _apply_account_action(update, cfg, action, [a.index for a in cfg.accounts])
 
 
 async def cmd_start_session(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Config):
     if not _check_chat(cfg, update):
+        return
+    if await _apply_command_args(update, cfg, "start", context):
         return
     if len(cfg.accounts) == 1:
         await _apply_account_action(update, cfg, "start", cfg.accounts[0].index)
@@ -108,6 +189,8 @@ async def cmd_start_session(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Config):
     if not _check_chat(cfg, update):
         return
+    if await _apply_command_args(update, cfg, "watch", context):
+        return
     if len(cfg.accounts) == 1:
         await _apply_account_action(update, cfg, "watch", cfg.accounts[0].index)
         return
@@ -116,6 +199,8 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Con
 
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Config):
     if not _check_chat(cfg, update):
+        return
+    if await _apply_command_args(update, cfg, "run", context):
         return
     if len(cfg.accounts) == 1:
         await _apply_account_action(update, cfg, "run", cfg.accounts[0].index)
@@ -126,10 +211,33 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Confi
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Config):
     if not _check_chat(cfg, update):
         return
+    if await _apply_command_args(update, cfg, "stop", context):
+        return
     if len(cfg.accounts) == 1:
         await _apply_account_action(update, cfg, "stop", cfg.accounts[0].index)
         return
     await _ask_account(update, cfg, "stop", "остановить (/stop)")
+
+
+async def cmd_run_all(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Config):
+    """Запускает ВСЕ кабинеты на взятие заявок (короткая форма /run all)."""
+    if not _check_chat(cfg, update):
+        return
+    await _all_accounts_action(update, cfg, "run")
+
+
+async def cmd_watch_all(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Config):
+    """Включает наблюдение во всех кабинетах."""
+    if not _check_chat(cfg, update):
+        return
+    await _all_accounts_action(update, cfg, "watch")
+
+
+async def cmd_stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Config):
+    """Останавливает ВСЕ кабинеты (короткая форма /stop all)."""
+    if not _check_chat(cfg, update):
+        return
+    await _all_accounts_action(update, cfg, "stop")
 
 
 async def cmd_snapshot(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Config):
@@ -149,6 +257,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Co
     if not _check_chat(cfg, update):
         return
     lines = [f"Кабинетов: {len(cfg.accounts)}"]
+    running = [
+        a.index for a in cfg.accounts
+        if (ws := state.workers.get(a.index)) is not None and ws.running
+    ]
+    lines.append(f"работает сейчас: {len(running)} из {len(cfg.accounts)}" + (f" (№{sorted(running)})" if running else ""))
     for account in cfg.accounts:
         ws = state.workers.get(account.index)
         lines.append(f"\n{account.index}. {account.name} — {_account_status(ws)}")
@@ -184,21 +297,22 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cf
 
     # 1) Активный диалог «какой кабинет?» (после /run, /stop, /watch, /start_session)
     if pending and pending.get("step") == "choose_account":
-        index = _parse_account_index(text, cfg)
-        if index is None:
+        indices = _parse_account_indices(text, cfg)
+        if not indices:
             # 3-8 цифр при активном ожидании 2FA — скорее всего это код, а не номер кабинета
             if awaiting and re.fullmatch(r"\d{3,8}", text):
                 state.chat_pending.pop(chat_id, None)
                 pending = None  # проваливаемся в обработку 2FA ниже
             else:
                 await update.message.reply_text(
-                    f"Не понял номер кабинета. Пришлите цифру из списка:\n{_accounts_list(cfg)}"
+                    "Не понял номер кабинета. Пришлите цифру из списка, "
+                    f"несколько номеров через пробел (1 3) или all:\n{_accounts_list(cfg)}"
                 )
                 return
         else:
             action = pending.get("action", "run")
             state.chat_pending.pop(chat_id, None)
-            await _apply_account_action(update, cfg, action, index)
+            await _apply_account_action(update, cfg, action, indices)
             return
 
     # 2) Диалог «номер кабинета + код» — когда код 2FA ждут сразу несколько кабинетов
@@ -242,7 +356,10 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cf
 
     await update.message.reply_text(
         "Команды: /run /stop /watch /status /snapshot /id\n"
-        "Пример: /run — бот спросит, какой кабинет запустить, пришлите номер цифрами."
+        "Несколько кабинетов сразу: /run 1 3 · /run all · /runall "
+        "(так же /stop, /watch → /stopall, /watchall).\n"
+        "Без аргументов бот спросит, какие кабинеты запустить — "
+        "можно прислать «1 3» или «all»."
     )
 
 
@@ -253,6 +370,10 @@ def build_bot_app(cfg: Config) -> Application:
     application.add_handler(CommandHandler("watch", lambda u, c: cmd_watch(u, c, cfg)))
     application.add_handler(CommandHandler("run", lambda u, c: cmd_run(u, c, cfg)))
     application.add_handler(CommandHandler("stop", lambda u, c: cmd_stop(u, c, cfg)))
+    # Короткие формы для мультиаккаунта — сразу все кабинеты.
+    application.add_handler(CommandHandler("runall", lambda u, c: cmd_run_all(u, c, cfg)))
+    application.add_handler(CommandHandler("watchall", lambda u, c: cmd_watch_all(u, c, cfg)))
+    application.add_handler(CommandHandler("stopall", lambda u, c: cmd_stop_all(u, c, cfg)))
     application.add_handler(CommandHandler("snapshot", lambda u, c: cmd_snapshot(u, c, cfg)))
     application.add_handler(CommandHandler("status", lambda u, c: cmd_status(u, c, cfg)))
     # /id доступен ЛЮБОМУ — чтобы новый человек узнал свой chat_id для добавления

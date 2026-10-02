@@ -8,6 +8,7 @@ import json
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -348,6 +349,103 @@ class ParallelPollersTest(unittest.TestCase):
 
             self.assertEqual(len(posted), 1, f"ожидался ровно 1 POST, получено {len(posted)}")
             self.assertIn("payout_id=6408416", posted[0])
+
+
+class TwoAccountsConcurrentlyTest(unittest.TestCase):
+    """Два кабинета работают одновременно: у каждого свои cookies и свой опрос
+    очереди, заявки не перепутываются между кабинетами."""
+
+    def setUp(self):
+        state.workers.clear()
+        state.chat_pending.clear()
+
+    @unittest.skipUnless(DUMP_ROWS.exists(), "нет HTML-дампов в ./data")
+    def test_two_accounts_take_their_own_orders_in_parallel(self):
+        row_html = DUMP_ROWS.read_text(encoding="utf-8")
+        first_id, second_id = "6408416", "6408417"
+        self.assertIn(first_id, row_html)
+        page1 = (
+            "<!DOCTYPE html><html><body><table class='payout-table'><tbody>"
+            + row_html
+            + "</tbody></table></body></html>"
+        )
+        # кабинет №2 видит свою заявку (другой id) на своём сервере
+        page2 = page1.replace(first_id, second_id)
+
+        server1, posted1, port1 = _start_queue_server(page1)
+        server2, posted2, port2 = _start_queue_server(page2)
+        base1 = f"http://127.0.0.1:{port1}/account/payouts/"
+        base2 = f"http://127.0.0.1:{port2}/account/payouts/"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            accounts = [
+                Account(
+                    index=1,
+                    name="Кабинет 1",
+                    login="a@b.c",
+                    password="p",
+                    storage_state_path=str(DATA / "auth.json"),
+                ),
+                Account(
+                    index=2,
+                    name="Кабинет 2",
+                    login="d@e.f",
+                    password="p",
+                    storage_state_path=str(Path(tmp) / "auth_2.json"),
+                ),
+            ]
+            cfg = make_config(
+                accounts=accounts,
+                debug_capture_attempts=False,
+                target_queue_size=1,
+                take_poll_min_ms=50,
+                take_poll_max_ms=80,
+                metrics_path=str(Path(tmp) / "metrics.jsonl"),
+            )
+            # у каждого кабинета свой сайт/очередь (в реальности — свои cookies)
+            cfg1 = replace(cfg, queue_url=base1 + "?sub=payouts_choice", demands_url=base1 + "?sub=demands")
+            cfg2 = replace(cfg, queue_url=base2 + "?sub=payouts_choice", demands_url=base2 + "?sub=demands")
+
+            ws1 = state.ensure(1, "Кабинет 1")
+            ws1.running, ws1.mode = True, "take"
+            ws2 = state.ensure(2, "Кабинет 2")
+            ws2.running, ws2.mode = True, "take"
+
+            async def notify(text: str):
+                pass
+
+            async def notify_file(path: str, caption: str = ""):
+                pass
+
+            async def run():
+                client1, client2 = PayoutClient(cfg1, {}), PayoutClient(cfg2, {})
+                task1 = asyncio.create_task(
+                    take_loop(client1, cfg1, accounts[0], ws1, notify, notify_file, Metrics(cfg1))
+                )
+                task2 = asyncio.create_task(
+                    take_loop(client2, cfg2, accounts[1], ws2, notify, notify_file, Metrics(cfg2))
+                )
+                await asyncio.sleep(0.8)
+                ws1.running = ws2.running = False
+                await asyncio.wait_for(asyncio.gather(task1, task2), timeout=3)
+                await client1.aclose()
+                await client2.aclose()
+
+            try:
+                asyncio.run(run())
+            finally:
+                ws1.running = ws2.running = False
+                for server in (server1, server2):
+                    server.shutdown()
+                    server.server_close()
+
+            self.assertEqual(len(posted1), 1, f"кабинет 1: ожидался 1 POST, получено {len(posted1)}")
+            self.assertEqual(len(posted2), 1, f"кабинет 2: ожидался 1 POST, получено {len(posted2)}")
+            self.assertIn(f"payout_id={first_id}", posted1[0])
+            self.assertIn(f"payout_id={second_id}", posted2[0])
+            self.assertEqual(ws1.taken_order_ids, {first_id})
+            self.assertEqual(ws2.taken_order_ids, {second_id})
+            self.assertEqual((ws1.taken_count, ws2.taken_count), (1, 1))
 
 
 if __name__ == "__main__":
