@@ -48,6 +48,8 @@ class Config:
     metrics_path: str
     worker_backend: str
     take_parallel_pollers: int
+    # как часто (сек) сверяемся со страницей demands: сколько заявок в работе
+    demands_sync_s: int = 10
 
     @property
     def allowed_chat_id(self) -> int:
@@ -190,5 +192,7 @@ def load_config() -> Config:
         worker_backend=env.get("WORKER_BACKEND", "http").lower(),
         # сколько независимых воронок опрашивают очередь одновременно (1 = одна)
         take_parallel_pollers=int(env.get("TAKE_PARALLEL_POLLERS", "1")),
+        # как часто (сек) сверяемся со страницей demands: истина о занятых слотах
+        demands_sync_s=max(1, int(env.get("DEMANDS_SYNC_S", "10"))),
     )
 

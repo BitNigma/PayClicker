@@ -24,6 +24,11 @@ class WorkerState:
     last_status: str = "idle"
     taken_count: int = 0
     taken_order_ids: set = field(default_factory=set)
+    # Заявки, которые прямо сейчас занимают слот на площадке (страница demands):
+    # и взятые нами, и выданные сайтом автоматически, и оставшиеся с прошлого
+    # запуска процесса. Источник правды о размере активной очереди — площадка,
+    # а не память: при рестарте память пуста, а заявки в работе остаются.
+    demands_ids: set = field(default_factory=set)
     snapshot_requested: bool = False
 
     # Канал, через который телеграм-бот прокидывает введённый 2FA-код в воркер
@@ -38,6 +43,16 @@ class WorkerState:
 
     def submit_2fa_code(self, code: str) -> None:
         self.two_fa_queue.put_nowait(code)
+
+    def slots_taken(self, inflight=()) -> int:
+        """Сколько слотов целевой очереди занято прямо сейчас.
+
+        Объединяем три источника: заявки «в работе» на площадке (`demands_ids`),
+        взятые в этой сессии (`taken_order_ids`) и отправленные, но ещё не
+        подтверждённые (`inflight`). Дедуп по id, поэтому счёт корректен и когда
+        сверка со страницей demands недоступна (тогда работаем по памяти).
+        """
+        return len(self.demands_ids | self.taken_order_ids | set(inflight))
 
 
 @dataclass
@@ -71,6 +86,7 @@ class BotState:
         "last_status",
         "taken_count",
         "taken_order_ids",
+        "demands_ids",
         "snapshot_requested",
         "two_fa_queue",
     )

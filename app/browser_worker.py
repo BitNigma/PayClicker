@@ -269,6 +269,53 @@ async def _get_payout_rows(page: Page):
 STATUS_IN_WORK_MARKER = "в работе у провайдера"  # пока статус содержит это — заявка ещё выполняется
 
 
+def _in_work_ids(rows) -> set:
+    """id заявок, которые занимают слот целевой очереди (статус «в работе у провайдера»).
+
+    На странице demands это и взятые нами заявки, и выданные площадкой
+    автоматически — место в очереди занимают обе категории.
+    """
+    return {
+        r["id"]
+        for r in rows
+        if r.get("id") and STATUS_IN_WORK_MARKER in (r.get("status") or "").lower()
+    }
+
+
+async def _read_demand_rows(status_page: Page, cfg: Config) -> list[dict] | None:
+    """Строки страницы demands (все статусы) или None, если страницу прочитать не удалось."""
+    try:
+        await status_page.goto(cfg.demands_url, wait_until="domcontentloaded")
+        return await _get_payout_rows(status_page)
+    except Exception:
+        logger.exception("Не удалось прочитать demands для сверки очереди")
+        return None
+
+
+async def _sync_demands_on_start(status_page: Page, cfg: Config, notify) -> None:
+    """Сверка с площадкой перед стартом взятия: сколько заявок УЖЕ в работе.
+
+    Очередь в памяти живёт только до перезапуска процесса, а часть заявок сайт
+    выдаёт автоматически (без нашего «Забрать выплату») — без этой сверки бот
+    после рестарта набирает лишние заявки сверх TARGET_QUEUE_SIZE.
+    """
+    rows = await _read_demand_rows(status_page, cfg)
+    if rows is None:
+        await notify(
+            "⚠️ Страница demands недоступна — считаю очередь по памяти "
+            "(после перезапуска возможен перебор заявок)."
+        )
+        return
+    in_work = _in_work_ids(rows)
+    state.demands_ids = in_work
+    ids_str = f" ({', '.join(f'#{i}' for i in sorted(in_work))})" if in_work else ""
+    free = max(0, cfg.target_queue_size - len(in_work))
+    await notify(
+        f"📊 Сверка с площадкой: в работе уже {len(in_work)}/{cfg.target_queue_size} заявок"
+        f"{ids_str}. Возьму ещё {free}."
+    )
+
+
 async def _confirm_taken(page: Page, cfg: Config, order_id: str, attempts: int = 6, delay: float = 0.5) -> bool:
     """Быстрая проверка (без долгих пауз), что заявка реально появилась на demands
     именно под нашим кликом, а не ушла конкуренту в последний момент."""
@@ -326,7 +373,9 @@ async def _setup_live_observer(page: Page, signal_queue: asyncio.Queue):
 
 
 def _queue_snapshot_text(cfg: Config) -> str:
-    ids = sorted(state.taken_order_ids)
+    """Снимок занятых слотов. Берём площадку (state.demands_ids), а не только память:
+    после рестарта процесса взятые ранее заявки тоже занимают слот."""
+    ids = sorted(state.demands_ids | state.taken_order_ids)
     if not ids:
         return f"Очередь пуста (0/{cfg.target_queue_size})."
     ids_str = ", ".join(f"#{i}" for i in ids)
@@ -367,6 +416,8 @@ async def _confirm_and_report(confirm_page: Page, confirm_lock: asyncio.Lock, cf
     if confirmed:
         state.taken_count += 1
         state.taken_order_ids.add(order_id)
+        # Заявка сразу занимает слот: не ждём следующей сверки с demands.
+        state.demands_ids.add(order_id)
         await notify(f"✅ Взята заявка #{order_id}")
         await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg)}")
     else:
@@ -423,8 +474,9 @@ async def _capture_and_submit_form(page: Page, row_el, cfg: Config, notify_file,
 
 async def fast_take_loop(choice_page: Page, confirm_page: Page, cfg: Config, notify, notify_file):
     """Событийное взятие заявок: реагируем на изменение DOM почти мгновенно,
-    без ожидания периодического reload. Дефицит считаем по числу ID в нашей
-    же памяти (state.taken_order_ids), не опрашивая demands на каждой итерации."""
+    без ожидания периодического reload. Дефицит считаем по данным площадки
+    (state.demands_ids) плюс своя память, не опрашивая demands на каждой
+    итерации: сверку раз в DEMANDS_SYNC_S секунд делает status_loop."""
     _register_dialog_autoaccept(choice_page)
     signal_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
     confirm_lock = asyncio.Lock()
@@ -444,9 +496,12 @@ async def fast_take_loop(choice_page: Page, confirm_page: Page, cfg: Config, not
     reload_count = 0
 
     while state.running and state.mode == "take":
-        deficit = cfg.target_queue_size - len(state.taken_order_ids)
+        # Занятые слоты считаем по площадке (state.demands_ids): там и наши заявки,
+        # и автовыдача, и оставшиеся с прошлого запуска процесса.
+        slots = state.slots_taken()
+        deficit = cfg.target_queue_size - slots
         if deficit <= 0:
-            state.last_status = f"take: очередь полная {len(state.taken_order_ids)}/{cfg.target_queue_size}"
+            state.last_status = f"take: очередь полная {slots}/{cfg.target_queue_size}"
             try:
                 await asyncio.wait_for(signal_queue.get(), timeout=2.0)
             except asyncio.TimeoutError:
@@ -456,7 +511,7 @@ async def fast_take_loop(choice_page: Page, confirm_page: Page, cfg: Config, not
                 await _send_live_snapshot(choice_page, cfg, notify, notify_file, "take")
             continue
 
-        state.last_status = f"take: очередь {len(state.taken_order_ids)}/{cfg.target_queue_size}, жду заявку"
+        state.last_status = f"take: очередь {slots}/{cfg.target_queue_size}, жду заявку"
 
         # ждём сигнал об изменении DOM; короткий таймаут — подстраховка на случай,
         # если observer что-то пропустил (например, сразу после навигации).
@@ -500,7 +555,11 @@ async def fast_take_loop(choice_page: Page, confirm_page: Page, cfg: Config, not
 
         row = rows[0]
         order_id = row.get("id")
-
+        if order_id and (order_id in state.demands_ids or order_id in state.taken_order_ids):
+            # Верхняя строка очереди уже занимает слот (взяли мы или выдала
+            # автовыдача, в т.ч. до перезапуска) — повторно форму не шлём.
+            await asyncio.sleep(random.uniform(cfg.take_poll_min_ms, cfg.take_poll_max_ms) / 1000)
+            continue
         row_html_before = None
         if cfg.debug_capture_attempts:
             try:
@@ -542,34 +601,48 @@ async def fast_take_loop(choice_page: Page, confirm_page: Page, cfg: Config, not
 
 
 async def status_loop(status_page: Page, cfg: Config, notify):
-    """Раз в 30 секунд проверяем статус ТОЛЬКО тех заявок, что в state.taken_order_ids.
-    Как только статус заявки из очереди перестаёт быть 'в работе у провайдера'
-    (неважно, выполнена она или завершилась с ошибкой) — убираем её из очереди."""
+    """Раз в DEMANDS_SYNC_S секунд сверяемся со страницей demands: сколько заявок в работе.
+
+    Источник правды о занятых слотах — площадка, а не память: заявку могли взять мы,
+    могли выдать автоматически (в памяти её нет вовсе), часть заявок осталась в работе
+    с прошлого запуска процесса. Как только заявка перестаёт быть «в работе у
+    провайдера» (выполнена или завершилась с ошибкой) — её слот свободен."""
     while state.running and state.mode == "take":
-        if state.taken_order_ids:
-            try:
-                await status_page.goto(cfg.demands_url, wait_until="domcontentloaded")
-                rows = await _get_payout_rows(status_page)
-                seen_status = {r["id"]: r["status"] for r in rows if r["id"]}
+        rows = await _read_demand_rows(status_page, cfg)
+        if rows is not None:
+            seen_status = {r["id"]: r["status"] for r in rows if r["id"]}
+            in_work = _in_work_ids(rows)
+            prev = state.demands_ids
+            state.demands_ids = in_work
 
-                for oid in list(state.taken_order_ids):
-                    status = seen_status.get(oid)
-                    if status is None:
-                        continue  # не видно сейчас — не трогаем, не рискуем задвоить взятие
-                    if STATUS_IN_WORK_MARKER not in status.lower():
-                        state.taken_order_ids.discard(oid)
-                        await notify(f"ℹ️ Заявка #{oid}: статус «{status}» — убираю из очереди, слот свободен.")
-                        await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg)}")
-            except Exception:
-                logger.exception("status_loop: ошибка проверки статусов")
+            # Заявки, которые были в работе, а теперь нет — слот освободился.
+            for oid in sorted(prev - in_work):
+                if oid in state.taken_order_ids:
+                    state.taken_order_ids.discard(oid)
+                    status = seen_status.get(oid) or "завершена"
+                    await notify(f"ℹ️ Заявка #{oid}: статус «{status}» — убираю из очереди, слот свободен.")
+                    await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg)}")
 
-        for _ in range(30):
+            # Заявки, которых мы не брали (автовыдача площадки) — тоже занимают слот.
+            auto = sorted(in_work - prev - state.taken_order_ids)
+            if auto:
+                auto_str = ", ".join(f"#{i}" for i in auto)
+                await notify(
+                    f"📦 Автовыдача: {auto_str} уже в работе (площадка выдала без нашего взятия)."
+                )
+                await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg)}")
+
+        for _ in range(max(1, cfg.demands_sync_s)):
             if not (state.running and state.mode == "take"):
                 break
             await asyncio.sleep(1)
 
 
 async def take_loop(choice_page: Page, confirm_page: Page, status_page: Page, cfg: Config, notify, notify_file):
+    # Сначала сверяемся с площадкой: сколько заявок уже в работе (включая
+    # автовыдачу и оставшиеся с прошлого запуска). Без этого после рестарта
+    # процесс набирает лишние заявки сверх TARGET_QUEUE_SIZE.
+    await _sync_demands_on_start(status_page, cfg, notify)
     await asyncio.gather(
         fast_take_loop(choice_page, confirm_page, cfg, notify, notify_file),
         status_loop(status_page, cfg, notify),

@@ -12,6 +12,12 @@ HTTP-запросами: GET очереди -> мгновенный разбор
 GET" и "отправили POST". Это и есть фактическое время реакции Python-клиента;
 по нему видно, где реально теряются миллисекунды: в сети или в накладных
 расходах клиента (тогда и стоит думать про Go).
+
+Размер активной очереди считается по площадке, а не по памяти: перед стартом и
+затем раз в DEMANDS_SYNC_S секунд бот сверяется со страницей demands (сколько
+заявок реально «в работе»). Причины две: очередь в памяти живёт только до
+перезапуска процесса, а часть заявок площадка выдаёт автоматически (без нашего
+«Забрать выплату») — обе занимают слот и должны учитываться в цель TARGET_QUEUE_SIZE.
 """
 from __future__ import annotations
 
@@ -105,6 +111,26 @@ def parse_rows(html: str) -> list[dict]:
             }
         )
     return rows
+
+
+def _ids_text(ids) -> str:
+    """«#6408416, #6408417» — для уведомлений в Telegram."""
+    return ", ".join(f"#{i}" for i in sorted(ids))
+
+
+def in_work_ids(rows: list[dict]) -> set[str]:
+    """id заявок, которые занимают слот целевой очереди (статус «в работе у провайдера»).
+
+    На странице demands это и заявки, взятые нами, и те, что площадка выдала
+    автоматически (без нажатия «Забрать выплату»): место в очереди занимают обе
+    категории, поэтому считаем их одинаково. Завершённые и ошибочные заявки сюда
+    не попадают — их слот свободен.
+    """
+    return {
+        r["id"]
+        for r in rows
+        if r.get("id") and STATUS_IN_WORK_MARKER in (r.get("status") or "").lower()
+    }
 
 
 def load_cookies(account) -> dict:
@@ -241,12 +267,14 @@ class PayoutClient:
 
 
 def _queue_snapshot_text(cfg: Config, ws: WorkerState) -> str:
-    ids = sorted(ws.taken_order_ids)
+    """Снимок занятых слотов. Источник — площадка (ws.demands_ids), а не только память:
+    после рестарта процесса взятые ранее заявки тоже занимают слот."""
+    ids = sorted(ws.demands_ids | ws.taken_order_ids)
     if not ids:
         return f"Очередь пуста (0/{cfg.target_queue_size})."
     return (
         f"В работе сейчас ({len(ids)}/{cfg.target_queue_size}): "
-        + ", ".join(f"#{i}" for i in ids)
+        + _ids_text(ids)
     )
 
 
@@ -324,6 +352,24 @@ async def _confirm_taken(
     return False
 
 
+async def fetch_demand_rows(client: PayoutClient, ws: WorkerState) -> list[dict] | None:
+    """Строки страницы demands (все статусы) или None, если страницу прочитать не удалось.
+
+    Единственный запрос, который говорит правду о занятых слотах: там и наши
+    заявки, и выданные площадкой автоматически, и оставшиеся с прошлого запуска
+    процесса. SessionExpired пробрасывается наверх — это признак, что сессия
+    кабинета слетела.
+    """
+    try:
+        html = await client.fetch_demands()
+    except SessionExpired:
+        raise
+    except Exception as exc:
+        logger.warning("[%s] сверка со страницей demands не удалась: %s", ws.name, exc)
+        return None
+    return parse_rows(html)
+
+
 async def _do_take(
     client: PayoutClient,
     cfg: Config,
@@ -399,6 +445,8 @@ async def _do_take(
         if confirmed:
             ws.taken_count += 1
             ws.taken_order_ids.add(order_id)
+            # Заявка сразу занимает слот: не ждём следующей сверки с demands.
+            ws.demands_ids.add(order_id)
             await notify(f"✅ Взята заявка #{order_id} (HTTP)")
             await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
         else:
@@ -407,29 +455,47 @@ async def _do_take(
         inflight.discard(order_id)
 
 
-async def status_loop(client: PayoutClient, cfg: Config, ws: WorkerState, notify) -> None:
-    """Раз в 30 секунд проверяем статус ТОЛЬКО своих заявок в ws.taken_order_ids."""
-    while ws.running and ws.mode == "take":
-        if ws.taken_order_ids:
-            try:
-                html = await client.fetch_demands()
-                seen = {r["id"]: r["status"] for r in parse_rows(html)}
-                for oid in list(ws.taken_order_ids):
-                    status = seen.get(oid)
-                    if status is None:
-                        continue  # сейчас не видно — не трогаем
-                    if STATUS_IN_WORK_MARKER not in status.lower():
-                        ws.taken_order_ids.discard(oid)
-                        await notify(
-                            f"ℹ️ Заявка #{oid}: статус «{status}» — убираю из очереди, слот свободен."
-                        )
-                        await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
-            except SessionExpired:
-                return
-            except Exception:
-                logger.exception("status_loop: ошибка проверки статусов")
+async def demands_loop(client: PayoutClient, cfg: Config, ws: WorkerState, notify) -> None:
+    """Раз в DEMANDS_SYNC_S секунд сверяемся со страницей demands: сколько заявок в работе.
 
-        for _ in range(30):
+    Это единственный источник правды о занятых слотах, потому что в памяти бота
+    заявок может не быть, хотя место в очереди они занимают:
+      • заявку взяли мы (тогда она есть и в ws.taken_order_ids);
+      • заявку площадка выдала автоматически — в памяти её не было вовсе;
+      • заявка осталась в работе с прошлого запуска процесса (память сбрасывается);
+      • заявка завершилась (статус уже не «в работе у провайдера») — слот свободен.
+
+    Раньше цикл смотрел только на ws.taken_order_ids и потому не видел ни
+    автовыдачи, ни заявок, взятых до перезапуска.
+    """
+    while ws.running and ws.mode == "take":
+        try:
+            rows = await fetch_demand_rows(client, ws)
+        except SessionExpired:
+            return
+        if rows is not None:
+            statuses = {r["id"]: r.get("status", "") for r in rows if r.get("id")}
+            in_work = in_work_ids(rows)
+            stale = ws.demands_ids
+            ws.demands_ids = in_work
+            # Заявки, которые были в работе, а теперь нет — их слот освободился.
+            for oid in sorted(stale - in_work):
+                if oid in ws.taken_order_ids:
+                    ws.taken_order_ids.discard(oid)
+                    status = statuses.get(oid) or "завершена"
+                    await notify(
+                        f"ℹ️ Заявка #{oid}: статус «{status}» — убираю из очереди, слот свободен."
+                    )
+                    await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
+            # Заявки, которых мы не брали (автовыдача площадки) — тоже занимают слот.
+            auto = sorted(in_work - stale - ws.taken_order_ids)
+            if auto:
+                await notify(
+                    f"📦 Автовыдача: {_ids_text(auto)} уже в работе "
+                    f"(площадка выдала без нашего взятия)."
+                )
+                await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
+        for _ in range(max(1, cfg.demands_sync_s)):
             if not (ws.running and ws.mode == "take"):
                 break
             await asyncio.sleep(1)
@@ -440,6 +506,22 @@ async def watch_loop(
 ) -> None:
     """Режим наблюдения по HTTP: ничего не берём, только уведомляем о новых заявках."""
     await notify("👀 HTTP-наблюдение запущено (без браузера). Сообщу, как только появится заявка.")
+    # Показываем реальную картину с площадки: сколько заявок уже в работе (в памяти
+    # их может не быть — часть выдаёт автовыдача, часть осталась с прошлого запуска).
+    try:
+        rows = await fetch_demand_rows(client, ws)
+    except SessionExpired:
+        ws.logged_in = False
+        ws.running = False
+        await notify("⚠️ Сессия слетела. Останавливаю наблюдение. Запусти кабинет заново (/run).")
+        return
+    if rows is not None:
+        ws.demands_ids = in_work_ids(rows)
+        await notify(
+            f"📊 Сверка с площадкой: в работе уже "
+            f"{len(ws.demands_ids)}/{cfg.target_queue_size} заявок "
+            f"(цель задаётся TARGET_QUEUE_SIZE)."
+        )
     prev_ids: set = set()
 
     while ws.running and ws.mode == "watch":
@@ -509,7 +591,8 @@ async def _poll_loop(
     """
     prev_get = 0.0
     while ws.running and ws.mode == "take":
-        reserved = len(ws.taken_order_ids) + len(inflight)
+        # Занятые слоты: заявки «в работе» на площадке + наши неподтверждённые отправки.
+        reserved = ws.slots_taken(inflight)
         if reserved >= cfg.target_queue_size:
             ws.last_status = f"take(http): очередь полная {reserved}/{cfg.target_queue_size}"
             await asyncio.sleep(_sleep_ms(cfg.take_poll_min_ms, cfg.take_poll_max_ms))
@@ -544,14 +627,17 @@ async def _poll_loop(
         }
         prev_get = t_recv
 
-        # Берём первую заявку, которой ещё нет у нас и которую мы не отправляли.
+        # Берём первую заявку, которой ещё нет в работе и которую мы не отправляли.
         # Проверка и пометка inflight идут БЕЗ await, значит атомарны для event loop —
         # поэтому даже несколько параллельных воронок не создадут дублей.
+        # ws.demands_ids — заявки, которые уже в работе на площадке (в т.ч. автовыдача
+        # и оставшиеся с прошлого запуска): их повторно не берём.
         candidate = next(
             (
                 r
                 for r in rows
                 if r["id"] not in inflight
+                and r["id"] not in ws.demands_ids
                 and r["id"] not in ws.taken_order_ids
                 and r.get("csrf_token")
             ),
@@ -591,7 +677,31 @@ async def take_loop(
         f"⚡ HTTP-режим взятия запущен (без браузера). Цель: {cfg.target_queue_size} заявок, "
         f"воронок опроса: {pollers}."
     )
-    status_task = asyncio.create_task(status_loop(client, cfg, ws, notify))
+    # Сначала сверяемся с площадкой: сколько заявок УЖЕ в работе. Очередь в памяти
+    # живёт только до перезапуска процесса, а часть заявок сайт выдаёт автоматически —
+    # без этой сверки после рестарта бот набирает лишние заявки сверх цели.
+    try:
+        rows = await fetch_demand_rows(client, ws)
+    except SessionExpired:
+        ws.logged_in = False
+        ws.running = False
+        await notify("⚠️ Сессия слетела на сверке с площадкой. Останавливаю. Запусти кабинет заново (/run).")
+        return
+    if rows is None:
+        await notify(
+            "⚠️ Страница demands недоступна — считаю очередь по памяти "
+            "(после перезапуска возможен перебор заявок)."
+        )
+    else:
+        ws.demands_ids = in_work_ids(rows)
+        free = max(0, cfg.target_queue_size - len(ws.demands_ids))
+        await notify(
+            f"📊 Сверка с площадкой: в работе уже "
+            f"{len(ws.demands_ids)}/{cfg.target_queue_size} заявок"
+            f"{': ' + _ids_text(ws.demands_ids) if ws.demands_ids else ''}. "
+            f"Возьму ещё {free}."
+        )
+    status_task = asyncio.create_task(demands_loop(client, cfg, ws, notify))
     inflight: set = set()
     take_tasks: set = set()
     poll_tasks = [

@@ -268,8 +268,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Co
         if ws is None:
             continue
         lines.append(f"   mode={ws.mode} logged_in={ws.logged_in} взято={ws.taken_count}")
-        if ws.taken_order_ids:
-            lines.append(f"   очередь={len(ws.taken_order_ids)} {sorted(ws.taken_order_ids)}")
+        # Занятые слоты: заявки «в работе» на площадке (в т.ч. автовыдача и взятые
+        # до перезапуска процесса) + взятые в этой сессии. Цель — TARGET_QUEUE_SIZE.
+        in_work = ws.demands_ids | ws.taken_order_ids
+        lines.append(
+            f"   в работе={ws.slots_taken()}/{cfg.target_queue_size}"
+            + (f" {sorted(in_work)}" if in_work else "")
+        )
         lines.append(f"   status={ws.last_status}")
     lines.append(f"\nадминов={len(cfg.allowed_chat_ids)}")
     await update.message.reply_text("\n".join(lines))

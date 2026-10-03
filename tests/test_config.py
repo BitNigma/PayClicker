@@ -1,7 +1,9 @@
 """Тесты парсинга id Telegram-админов (мультиадминный режим)."""
+import os
 import unittest
+from unittest.mock import patch
 
-from app.config import _ADMIN_ID_ENV_VARS, load_accounts, parse_chat_ids
+from app.config import _ADMIN_ID_ENV_VARS, load_accounts, load_config, parse_chat_ids
 
 
 class ParseChatIdsTest(unittest.TestCase):
@@ -101,6 +103,35 @@ class LoadAccountsTest(unittest.TestCase):
     def test_missing_base_login_raises(self):
         with self.assertRaises(RuntimeError):
             load_accounts({"SITE_PASSWORD": "pw"})
+
+
+class DemandsSyncConfigTest(unittest.TestCase):
+    """DEMANDS_SYNC_S: как часто бот сверяется со страницей demands (истина о занятых слотах)."""
+
+    BASE_ENV = {
+        "TELEGRAM_BOT_TOKEN": "t",
+        "TELEGRAM_ALLOWED_CHAT_ID": "1",
+        "SITE_LOGIN": "a@b.c",
+        "SITE_PASSWORD": "p",
+        "SITE_URL": "https://x/signin",
+        "QUEUE_URL": "https://x/queue",
+        "DEMANDS_URL": "https://x/demands",
+    }
+
+    def test_default_is_ten_seconds(self):
+        with patch.dict(os.environ, self.BASE_ENV, clear=True):
+            self.assertEqual(load_config().demands_sync_s, 10)
+
+    def test_env_override(self):
+        env = dict(self.BASE_ENV, DEMANDS_SYNC_S="30")
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(load_config().demands_sync_s, 30)
+
+    def test_minimum_is_one_second(self):
+        for raw in ("0", "-5"):
+            env = dict(self.BASE_ENV, DEMANDS_SYNC_S=raw)
+            with patch.dict(os.environ, env, clear=True):
+                self.assertEqual(load_config().demands_sync_s, 1, f"DEMANDS_SYNC_S={raw}")
 
 
 if __name__ == "__main__":
