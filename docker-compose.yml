@@ -1,16 +1,35 @@
+# Развёртывание на VPS (Hostinger и др.): ./deploy.sh, см. README → «Деплой на Hostinger».
+# Вручную: docker compose build && docker compose up -d ; логи: docker compose logs -f
+name: order-bot
+
 services:
   order-bot:
     build: .
-    container_name: order-bot
+    # стабильный тег: deploy.sh по нему понимает, что образ уже собран
+    image: order-bot:latest
     restart: unless-stopped
+    # PID 1 в контейнере — python под xvfb-run; без init дочерние процессы
+    # Chromium/Xvfb могут оставаться зомби и копить память.
+    init: true
+    # сколько ждать корректного завершения (закрытие браузера/сессий) перед SIGKILL
+    stop_grace_period: 30s
     env_file:
       - .env
     environment:
       STORAGE_STATE_PATH: /data/auth.json
       LOG_PATH: /data/actions.log
       HEADLESS: "false"   # в контейнере браузер идёт через Xvfb
+      # Часовой пояс для времени в логах и замерах; переопределяется в .env (TZ=…)
+      TZ: ${TZ:-Europe/Moscow}
     volumes:
-      # тут будут храниться сохранённая сессия (auth.json) и лог файл
-      - ./data:/data
+      # тут хранятся сохранённая сессия (auth.json), лог и debug-дампы;
+      # каталог на хосте можно переопределить в .env: DATA_DIR=/opt/order-bot-data
+      - ${DATA_DIR:-./data}:/data
     # shm нужен браузеру, дефолтных 64MB часто не хватает -> краши Chromium
     shm_size: "1gb"
+    # Ограничение логов Docker, иначе за месяцы работы они забьют диск VPS
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
