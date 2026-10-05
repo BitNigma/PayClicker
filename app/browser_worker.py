@@ -496,6 +496,13 @@ async def fast_take_loop(choice_page: Page, confirm_page: Page, cfg: Config, not
     reload_count = 0
 
     while state.running and state.mode == "take":
+        if state.resync_required:
+            # /reset_session очистил кэш: ждём, пока status_loop сделает свежую
+            # сверку с площадкой. На «пустом» кэше брать нельзя — наберём лишнее.
+            await notify("🔄 /reset_session: жду свежую сверку с площадкой…")
+            while state.resync_required and state.running and state.mode == "take":
+                await asyncio.sleep(0.5)
+            continue
         # Занятые слоты считаем по площадке (state.demands_ids): там и наши заявки,
         # и автовыдача, и оставшиеся с прошлого запуска процесса.
         slots = state.slots_taken()
@@ -608,6 +615,27 @@ async def status_loop(status_page: Page, cfg: Config, notify):
     с прошлого запуска процесса. Как только заявка перестаёт быть «в работе у
     провайдера» (выполнена или завершилась с ошибкой) — её слот свободен."""
     while state.running and state.mode == "take":
+        # /reset_session попросил пересчитать очередь немедленно (не ждём
+        # DEMANDS_SYNC_S). После успешной сверки флаг снимается, и только тогда
+        # fast_take_loop продолжит брать заявки.
+        if state.resync_required:
+            try:
+                while state.resync_required and state.running and state.mode == "take":
+                    rows = await _read_demand_rows(status_page, cfg)
+                    if rows is None:
+                        for _ in range(max(1, cfg.demands_sync_s)):
+                            if not state.resync_required:
+                                break
+                            await asyncio.sleep(1)
+                        continue
+                    state.taken_order_ids.intersection_update(_in_work_ids(rows))
+                    # Сверка пересоздаёт demands_ids целиком: старые «мёртвые» id
+                    # из памяти выпадут автоматически.
+                    state.demands_ids = _in_work_ids(rows)
+                    state.resync_required = False
+                    await notify(f"🔄 /reset_session: очередь пересчитана по площадке. {_queue_snapshot_text(cfg)}")
+            except Exception:
+                logger.exception("Ошибка resync после /reset_session")
         rows = await _read_demand_rows(status_page, cfg)
         if rows is not None:
             seen_status = {r["id"]: r["status"] for r in rows if r["id"]}

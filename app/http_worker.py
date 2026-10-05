@@ -517,6 +517,7 @@ async def watch_loop(
         return
     if rows is not None:
         ws.demands_ids = in_work_ids(rows)
+        ws.taken_order_ids.intersection_update(ws.demands_ids)
         await notify(
             f"📊 Сверка с площадкой: в работе уже "
             f"{len(ws.demands_ids)}/{cfg.target_queue_size} заявок "
@@ -525,6 +526,10 @@ async def watch_loop(
     prev_ids: set = set()
 
     while ws.running and ws.mode == "watch":
+        if ws.resync_required:
+            # /reset_session во время наблюдения: очищаем кэш и делаем свежую сверку.
+            await resync_demands_loop(client, cfg, ws, notify)
+            continue
         t_sent = time.perf_counter()
         try:
             html = await client.fetch_queue()
@@ -658,6 +663,46 @@ async def _poll_loop(
         await asyncio.sleep(0)
 
 
+async def resync_demands_loop(client: PayoutClient, cfg: Config, ws: WorkerState, notify) -> None:
+    """Свежая сверка со страницей demands ПО ЗАПРОСУ (/reset_session).
+
+    /reset_session очистил кэш очереди (taken_order_ids/demands_ids/taken_count)
+    и поставил ws.resync_required. Пока этот флаг поднят, слоты считаются пустыми
+    (см. WorkerState.slots_taken) — этот цикл обязан первым делом перечитать
+    demands и дать правду о занятых слотах, иначе воркер наберёт заявок сверх
+    TARGET_QUEUE_SIZE на «пустом» кэше.
+    """
+    while ws.resync_required:
+        try:
+            rows = await fetch_demand_rows(client, ws)
+        except SessionExpired:
+            return  # сессию чинит run_worker (start_session/ensure_session)
+        if rows is not None:
+            ws.demands_ids = in_work_ids(rows)
+            # Стираем «мёртвые» id из памяти вместе со сверкой — это и есть
+            # лечение накопленного кэша (бот писал «в работе 10», реально 1).
+            ws.taken_order_ids.intersection_update(ws.demands_ids)
+            ws.resync_required = False
+            free = max(0, cfg.target_queue_size - len(ws.demands_ids))
+            await notify(
+                f"🔄 /reset_session: очередь пересчитана по площадке. "
+                f"В работе сейчас {len(ws.demands_ids)}/{cfg.target_queue_size}"
+                f"{': ' + _ids_text(ws.demands_ids) if ws.demands_ids else ''}. "
+                f"Возьму ещё {free}."
+            )
+            return
+        # Страница недоступна — не зацикливаемся с бешеным ретраем:
+        # notified_no in 1s, повторная попытка через DEMANDS_SYNC_S (см. demands_loop).
+        await notify(
+            "⚠️ /reset_session: страница demands пока недоступна — повторить "
+            f"попытку через {cfg.demands_sync_s} с."
+        )
+        for _ in range(max(1, cfg.demands_sync_s)):
+            if not ws.resync_required:
+                return
+            await asyncio.sleep(1)
+
+
 async def take_loop(
     client: PayoutClient, cfg: Config, account, ws: WorkerState, notify, notify_file, metrics: Metrics
 ) -> None:
@@ -678,8 +723,13 @@ async def take_loop(
         f"воронок опроса: {pollers}."
     )
     # Сначала сверяемся с площадкой: сколько заявок УЖЕ в работе. Очередь в памяти
-    # живёт только до перезапуска процесса, а часть заявок сайт выдаёт автоматически —
-    # без этой сверки после рестарта бот набирает лишние заявки сверх цели.
+    if ws.resync_required:
+        # /reset_session очистил кэш, пока мы были в фоне: приводим в соответствие
+        # с площадкой прямо сейчас, дальше уже по обычному пути сверки.
+        await resync_demands_loop(client, cfg, ws, notify)
+    # Снимок ДО запроса: заявку, ПОДТВЕРЖДЁННУЮ во время этого запроса (её нет в
+    # свежем HTML, сайт ещё не отдал), не считаем «мёртвым мусором» и не удаляем.
+    taken_before = set(ws.taken_order_ids)
     try:
         rows = await fetch_demand_rows(client, ws)
     except SessionExpired:
@@ -693,7 +743,19 @@ async def take_loop(
             "(после перезапуска возможен перебор заявок)."
         )
     else:
-        ws.demands_ids = in_work_ids(rows)
+        # Приводим и площадку, и локальный кэш к одной картине. Ключевой момент:
+        # старые id из ОПЕРАТИВНОЙ памяти (taken_order_ids), которых больше нет
+        # на demands, выкидываем — без этого после перезапусков «мёртвые» заявки
+        # копятся и бот пишет «в работе 10» при реальной 1.
+        in_work = in_work_ids(rows)
+        stale_taken = taken_before - in_work
+        if stale_taken:
+            await notify(
+                f"🧹 Память: убираю {len(stale_taken)} заявок, которых уже нет "
+                f"в работе на площадке: {_ids_text(stale_taken)}."
+            )
+        ws.taken_order_ids.difference_update(stale_taken)
+        ws.demands_ids = in_work
         free = max(0, cfg.target_queue_size - len(ws.demands_ids))
         await notify(
             f"📊 Сверка с площадкой: в работе уже "
@@ -710,12 +772,20 @@ async def take_loop(
         )
         for _ in range(pollers)
     ]
+    # Живой ответ на /reset_session: пока флаг поднят, слоты считаются пустыми —
+    # воркер должен сделать свежую сверку с площадкой и только потом брать заявки.
+    resync_task = asyncio.create_task(resync_demands_loop(client, cfg, ws, notify))
     try:
         await asyncio.gather(*poll_tasks)
     finally:
         status_task.cancel()
+        resync_task.cancel()
         try:
             await status_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        try:
+            await resync_task
         except (asyncio.CancelledError, Exception):
             pass
         # Гасим незавершённые взятия до закрытия клиента (иначе — "client closed").

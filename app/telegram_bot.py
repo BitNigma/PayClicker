@@ -70,6 +70,7 @@ _ACTION_TITLES = {
     "watch": "👀 Включаю наблюдение",
     "stop": "⏹ Останавливаю",
     "start": "🚀 Запускаю",
+    "reset": "🧹 Сбрасываю кэш очереди /reset_session",
 }
 
 
@@ -130,6 +131,18 @@ async def _apply_account_action(update: Update, cfg: Config, action: str, index)
         elif action == "run":
             ws.mode = "take"
         # action == "start" — режим не меняем, только запускаем
+        # action == "reset" — не меняем ни режим, ни running, только кэш очереди
+
+        if action == "reset":
+            had_stale = bool(ws.taken_order_ids or ws.demands_ids or ws.taken_count)
+            ws.reset_queue_cache()
+            if had_stale:
+                lines.append(
+                    f"🧹 Кабинет «{ws.name}»: кэш очереди очищен, работаю по данным площадки."
+                )
+            else:
+                lines.append(f"ℹ️ Кабинет «{ws.name}»: кэш очереди был пуст. Ничего не очищал.")
+            continue
 
         already = ws.running
         ws.running = True
@@ -217,6 +230,19 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Conf
         await _apply_account_action(update, cfg, "stop", cfg.accounts[0].index)
         return
     await _ask_account(update, cfg, "stop", "остановить (/stop)")
+
+
+async def cmd_reset_session(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Config):
+    """Очистка локального кэша очереди кабинета: бот заново считает активную очередь
+    по странице demands (а не по накопленной в памяти). Cookies/сессию сайта не трогаем."""
+    if not _check_chat(cfg, update):
+        return
+    if await _apply_command_args(update, cfg, "reset", context):
+        return
+    if len(cfg.accounts) == 1:
+        await _apply_account_action(update, cfg, "reset", cfg.accounts[0].index)
+        return
+    await _ask_account(update, cfg, "reset", "сбросить кэш очереди (/reset_session)")
 
 
 async def cmd_run_all(update: Update, context: ContextTypes.DEFAULT_TYPE, cfg: Config):
@@ -360,9 +386,11 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cf
         return
 
     await update.message.reply_text(
-        "Команды: /run /stop /watch /status /snapshot /id\n"
+        "Команды: /run /stop /watch /status /snapshot /reset_session /id\n"
         "Несколько кабинетов сразу: /run 1 3 · /run all · /runall "
         "(так же /stop, /watch → /stopall, /watchall).\n"
+        "/reset_session — очистить кэш очереди кабинета (пересчёт по площадке), "
+        "если счётчик «в работе» разошёлся с реальностью.\n"
         "Без аргументов бот спросит, какие кабинеты запустить — "
         "можно прислать «1 3» или «all»."
     )
@@ -375,6 +403,7 @@ def build_bot_app(cfg: Config) -> Application:
     application.add_handler(CommandHandler("watch", lambda u, c: cmd_watch(u, c, cfg)))
     application.add_handler(CommandHandler("run", lambda u, c: cmd_run(u, c, cfg)))
     application.add_handler(CommandHandler("stop", lambda u, c: cmd_stop(u, c, cfg)))
+    application.add_handler(CommandHandler("reset_session", lambda u, c: cmd_reset_session(u, c, cfg)))
     # Короткие формы для мультиаккаунта — сразу все кабинеты.
     application.add_handler(CommandHandler("runall", lambda u, c: cmd_run_all(u, c, cfg)))
     application.add_handler(CommandHandler("watchall", lambda u, c: cmd_watch_all(u, c, cfg)))

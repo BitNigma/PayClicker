@@ -12,6 +12,7 @@ from app.telegram_bot import (
     build_bot_app,
     cmd_run,
     cmd_run_all,
+    cmd_reset_session,
     cmd_status,
     cmd_stop,
     cmd_stop_all,
@@ -225,6 +226,40 @@ class MultiAccountRunTest(DialogTestBase):
         asyncio.run(cmd_status(update, None, cfg))
         self.assertIn("работает сейчас: 2 из 3", message.replies[-1])
 
+    def test_reset_session_clears_stale_cache_and_keeps_running(self):
+        cfg = make_config(2)
+        # «Накопившийся кэш»: в памяти 10 «мёртвых» заявок + счётчик.
+        ws1 = state.ensure(1, "Кабинет 1")
+        ws1.running = True
+        ws1.mode = "take"
+        ws1.taken_order_ids = {str(i) for i in range(1000, 1010)}
+        ws1.demands_ids = {"1000", "1001", "1002"}
+        ws1.taken_count = 10
+        update, message = make_update("/reset_session 1")
+        asyncio.run(cmd_reset_session(update, SimpleNamespace(args=["1"]), cfg))
+        self.assertEqual(ws1.taken_order_ids, set())
+        self.assertEqual(ws1.demands_ids, set())
+        self.assertEqual(ws1.taken_count, 0)
+        # Воркер работает — флаг заставит его пересчитать очередь по площадке.
+        self.assertTrue(ws1.resync_required)
+        self.assertTrue(ws1.running)
+        self.assertIn("кэш очереди очищен", message.replies[-1])
+
+    def test_reset_session_all_clears_every_account(self):
+        cfg = make_config(3)
+        running = []
+        for i in (1, 2, 3):
+            ws = state.ensure(i, f"Кабинет {i}")
+            ws.running = True
+            ws.taken_order_ids = {str(i)}
+            ws.taken_count = 5
+            ws.demands_ids = {str(i)}
+            running.append(ws)
+        update, message = make_update("/reset_session all")
+        asyncio.run(cmd_reset_session(update, SimpleNamespace(args=["all"]), cfg))
+        self.assertTrue(all(not ws.taken_order_ids and not ws.demands_ids
+                            and ws.taken_count == 0 and ws.resync_required for ws in running))
+
 
 
 class BotCommandWiringTest(DialogTestBase):
@@ -246,6 +281,7 @@ class BotCommandWiringTest(DialogTestBase):
             "stopall",
             "status",
             "snapshot",
+            "reset_session",
             "id",
         ):
             self.assertIn(name, commands)

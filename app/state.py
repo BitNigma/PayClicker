@@ -30,6 +30,10 @@ class WorkerState:
     # а не память: при рестарте память пуста, а заявки в работе остаются.
     demands_ids: set = field(default_factory=set)
     snapshot_requested: bool = False
+    # /reset_session поставил True: кэш очереди очищен, воркер обязан сделать
+    # свежую сверку со страницей demands, ПРЕЖДЕ чем продолжать брать заявки
+    # (иначе на пустом кэше он наберёт лишнее сверх TARGET_QUEUE_SIZE).
+    resync_required: bool = False
 
     # Канал, через который телеграм-бот прокидывает введённый 2FA-код в воркер
     two_fa_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -51,8 +55,30 @@ class WorkerState:
         взятые в этой сессии (`taken_order_ids`) и отправленные, но ещё не
         подтверждённые (`inflight`). Дедуп по id, поэтому счёт корректен и когда
         сверка со страницей demands недоступна (тогда работаем по памяти).
+
+        Пока идёт ресинхронизация после /reset_session — возвращаем 0, чтобы
+        воркер не начал брать заявки на основании пустого (ещё не сверенного)
+        кэша: слоты всё равно посчитаются заново при первой свежей сверке.
         """
+        if self.resync_required:
+            return 0
         return len(self.demands_ids | self.taken_order_ids | set(inflight))
+
+    def reset_queue_cache(self) -> None:
+        """Полная очистка локального кэша очереди кабинета (команда /reset_session).
+
+        Стираем ТОЛЬКО память бота: взятые этой сессией заявки, сверку со
+        страницей demands и счётчик. Cookies/сессию сайта (auth.json) не трогаем —
+        это не «разлогин», а пересчёт активной очереди с нуля.
+
+        Если воркер сейчас работает — выставляем флаг resync_required, под которым
+        цикл обязан ПЕРЕД продолжением сделать свежую сверку с площадкой.
+        """
+        self.taken_order_ids.clear()
+        self.demands_ids.clear()
+        self.taken_count = 0
+        if self.running:
+            self.resync_required = True
 
 
 @dataclass
@@ -88,6 +114,7 @@ class BotState:
         "taken_order_ids",
         "demands_ids",
         "snapshot_requested",
+        "resync_required",
         "two_fa_queue",
     )
 

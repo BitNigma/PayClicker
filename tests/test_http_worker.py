@@ -588,6 +588,15 @@ class DemandsSlotAccountingTest(unittest.TestCase):
         self.assertEqual(ws.slots_taken(), 3)
         self.assertEqual(ws.slots_taken({"13", "10"}), 4)  # + отправленное, но не подтверждённое
 
+    def test_slots_taken_hidden_while_resync_pending(self):
+        """Пока /reset_session не сверён с площадкой, воркер считает слоты пустыми
+        и не берёт заявки на основании очищенного кэша."""
+        ws = state.ensure(1, "Кабинет 1")
+        ws.demands_ids = {"10", "11"}
+        ws.taken_order_ids = {"11", "12"}
+        ws.resync_required = True
+        self.assertEqual(ws.slots_taken(), 0)
+
     def test_preflight_sync_counts_orders_already_in_work(self):
         """Перед стартом бот спрашивает площадку: часть заявок уже в работе (в т.ч. автовыдача)."""
         queue = _page_html(_row_html("5001", "Ждет провайдера"))
@@ -719,6 +728,68 @@ class DemandsSlotAccountingTest(unittest.TestCase):
                 self.assertEqual(ws.demands_ids | ws.taken_order_ids, {"6001", "7777"})
                 self.assertEqual(ws.slots_taken(), 2)
                 self.assertIn("📦 Автовыдача: #7777", "\n".join(texts))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_reset_session_resyncs_cache_from_platform(self):
+        """/reset_session при работающем воркере: кэш очищен, но перед взятием новых
+        заявок воркер пересчитывает очередь по площадке (и «мёртвые» id из памяти
+        не «оживают» после сброса — берём только заявки, которых нет на demands)."""
+        queue = _page_html(_row_html("7001", "Ждет провайдера"))
+        # На площадке реально «в работе» только одна заявка, хотя в кэше бота их 10.
+        demands = _page_html(
+            _row_html("9001", "В работе у провайдера", with_form=False),
+        )
+        server, posted, port = _start_payout_server(queue, demands)
+        base = f"http://127.0.0.1:{port}/account/payouts/"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                cfg = make_config(
+                    queue_url=base + "?sub=payouts_choice",
+                    demands_url=base + "?sub=demands",
+                    metrics_path=str(Path(tmp) / "metrics.jsonl"),
+                    debug_capture_attempts=False,
+                    target_queue_size=1,
+                    demands_sync_s=5,
+                    take_poll_min_ms=50,
+                    take_poll_max_ms=80,
+                )
+                ws = state.ensure(1, "Кабинет 1")
+                ws.running, ws.mode = True, "take"
+                # «Накопившийся кэш»: 9 мёртвых id + 1 реальная на площадке.
+                ws.taken_order_ids = {str(1000 + i) for i in range(10)}
+                ws.demands_ids = {str(1000 + i) for i in range(10)}
+                ws.taken_count = 10
+                # Команда /reset_session уже выполнилась: кэш очищен, флаг стоит.
+                ws.reset_queue_cache()
+                self.assertTrue(ws.resync_required)
+                texts, notify, notify_file = self._collector()
+
+                async def run():
+                    import asyncio as _asyncio
+                    from app.http_worker import PayoutClient as _PC, Metrics as _M
+
+                    client = _PC(cfg, {})
+                    try:
+                        task = _asyncio.create_task(
+                            take_loop(client, cfg, cfg.accounts[0], ws, notify, notify_file, _M(cfg))
+                        )
+                        await _asyncio.sleep(1.0)
+                        ws.running = False
+                        await _asyncio.wait_for(task, timeout=5)
+                    finally:
+                        await client.aclose()
+
+                asyncio.run(run())
+                joined = "\n".join(texts)
+                # Ресинхронизация прошла, флаг снят, кэш = реальная картина площадки.
+                self.assertFalse(ws.resync_required)
+                self.assertEqual(ws.demands_ids, {"9001"})
+                self.assertEqual(ws.taken_order_ids, set())
+                self.assertIn("очередь пересчитана по площадке", joined)
+                # Целевая очередь 1/1 — новая заявка из очереди НЕ берётся.
+                self.assertEqual(len(posted), 0, posted)
         finally:
             server.shutdown()
             server.server_close()
