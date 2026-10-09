@@ -107,6 +107,78 @@ def _is_challenge_page(html: str) -> bool:
     return any(m in low for m in markers)
 
 
+# -------------------------------------------------------------------------
+# Клик по Cloudflare Turnstile «Verify you are human».
+#
+# Интерактивная проверка Cloudflare рендерится виджетом Turnstile внутри
+# iframe с домена challenges.cloudflare.com: сам чекбокс — во вложенном
+# документе, обычным page.click его не достать. Поэтому кликаем через
+# frame_locator (Playwright сам прокинет клик внутрь нужного iframe).
+# Всё best-effort: если клик не удался, внешние циклы продолжат ждать и
+# попробуют ещё раз на следующей итерации.
+# -------------------------------------------------------------------------
+TURNSTILE_IFRAME_SELECTORS = (
+    "iframe[src*='challenges.cloudflare.com']",
+    "iframe[src*='challenge-platform']",
+    "iframe[title*='Cloudflare']",
+    "iframe[title*='challenge']",
+)
+
+# Кандидаты-чекбоксы. Внутри iframe Turnstile это обычно input[type=checkbox]
+# (сам чекбокс) или кликабельный label; у managed challenge без iframe —
+# элементы внутри #challenge-stage.
+TURNSTILE_CHECKBOX_SELECTORS = (
+    "input[type='checkbox']",
+    ".ctp-checkbox-label",
+    "label[for*='checkbox']",
+    "[role='checkbox']",
+)
+
+
+async def _click_turnstile(page: Page, notify=None) -> bool:
+    """Пробует нажать чекбокс Cloudflare «Verify you are human» (Turnstile).
+
+    Возвращает True, если удалось кликнуть (один раз); при неудаче — False,
+    чтобы вызывающий цикл попробовал снова на следующей итерации (виджет
+    может дорисоваться не сразу). Ошибки глушим — это не критичный шаг.
+    """
+    clicked = False
+
+    # 1) Чекбокс внутри iframe Turnstile (основной случай).
+    for frame_sel in TURNSTILE_IFRAME_SELECTORS:
+        for cb_sel in TURNSTILE_CHECKBOX_SELECTORS:
+            try:
+                box = page.frame_locator(frame_sel).locator(cb_sel).first
+                if await box.count() and await box.is_visible():
+                    await box.click(timeout=2000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if clicked:
+            break
+
+    # 2) Managed challenge без iframe: чекбокс прямо в #challenge-stage.
+    if not clicked:
+        for cb_sel in (
+            "#challenge-stage input[type='checkbox']",
+            "#challenge-stage [role='checkbox']",
+            "#challenge-stage .ctp-checkbox-label",
+        ):
+            try:
+                box = page.locator(cb_sel).first
+                if await box.count() and await box.is_visible():
+                    await box.click(timeout=2000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+    if clicked and notify is not None:
+        await notify("🖱 Прошёл Cloudflare: нажал «Verify you are human».")
+    return clicked
+
+
 async def _wait_for_login_form(page: Page, cfg: Config, notify, timeout_s: int) -> bool:
     """Ждём форму входа, пережидая Cloudflare-проверку и редиректы.
 
@@ -116,6 +188,7 @@ async def _wait_for_login_form(page: Page, cfg: Config, notify, timeout_s: int) 
     was destroyed" (страница перезагружается) — норма, пропускаем их.
     """
     notified_challenge = False
+    clicked_challenge = False
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         # 1. Форма уже есть?
@@ -128,12 +201,16 @@ async def _wait_for_login_form(page: Page, cfg: Config, notify, timeout_s: int) 
         # 2. Не Cloudflare ли сейчас? (это не ошибка, а пауза — ждём дальше)
         try:
             html = await page.content()
-            if _is_challenge_page(html) and not notified_challenge:
-                notified_challenge = True
-                await notify(
-                    "⏳ Сайт показывает Cloudflare-проверку «человек ли вы» перед входом. "
-                    f"Жду, пока пройдёт (до {timeout_s} сек)…"
-                )
+            if _is_challenge_page(html):
+                if not notified_challenge:
+                    notified_challenge = True
+                    await notify(
+                        "⏳ Сайт показывает Cloudflare-проверку «человек ли вы» перед входом. "
+                        f"Жду, пока пройдёт (до {timeout_s} сек)…"
+                    )
+                # Пробуем сами нажать «Verify you are human», пока проверка не пройдёт.
+                if not clicked_challenge:
+                    clicked_challenge = await _click_turnstile(page, notify)
         except Exception:
             pass  # контекст пересоздаётся — пропускаем
 
@@ -156,6 +233,7 @@ async def _wait_challenge_passed(page: Page, cfg: Config, notify, timeout_s: int
     редиректит либо в кабинет, либо на /signin — и по нему уже можно решать.
     """
     notified = False
+    clicked = False
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
@@ -173,6 +251,9 @@ async def _wait_challenge_passed(page: Page, cfg: Config, notify, timeout_s: int
             await notify(
                 "⏳ Сайт показывает Cloudflare-проверку. Дожидаюсь, пока она пройдёт…"
             )
+        # Пробуем сами нажать «Verify you are human», пока проверка не пройдёт.
+        if not clicked:
+            clicked = await _click_turnstile(page, notify)
         await asyncio.sleep(1)
 
 

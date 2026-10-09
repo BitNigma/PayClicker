@@ -20,6 +20,7 @@ from app.browser_worker import (
     SEL_2FA_SUBMIT,
     SEL_LOGIN_INPUT,
     SEL_LOGIN_SUBMIT,
+    _click_turnstile,
     _is_challenge_page,
     _looks_like_cabinet,
     _looks_like_login_form,
@@ -461,6 +462,92 @@ class EnsureLoggedInTest(unittest.TestCase):
         self.assertTrue(ws.logged_in)
         self.assertEqual(context.storage_calls, [STORAGE_PATH])
         self.assertTrue(any("Введите код 2FA" in m for m in col.messages))
+
+
+class _FakeLocator:
+    """Локатор-заглушка: «видимый/невидимый», клики пишет в общий список."""
+
+    def __init__(self, visible, log, name):
+        self.first = self
+        self._visible = visible
+        self._log = log
+        self._name = name
+
+    async def count(self):
+        return 1 if self._visible else 0
+
+    async def is_visible(self):
+        return self._visible
+
+    async def click(self, timeout=None):
+        self._log.append(self._name)
+
+
+class _FakeFrameLocator:
+    """frame_locator(i).locator(sel) — «видим» только для заданных селекторов."""
+
+    def __init__(self, visible_selectors, log, prefix):
+        self._visible = visible_selectors
+        self._log = log
+        self._prefix = prefix
+
+    def locator(self, selector):
+        return _FakeLocator(
+            selector in self._visible, self._log, f"{self._prefix}:{selector}"
+        )
+
+
+class _FakeTurnstilePage:
+    """Page-заглушка: iframe-виджет Turnstile и/или managed challenge без iframe."""
+
+    def __init__(self, iframe_checkbox=False, stage_checkbox=False):
+        self.clicks = []
+        self.iframe_visible = {"input[type='checkbox']"} if iframe_checkbox else set()
+        self.stage_checkbox = stage_checkbox
+
+    def frame_locator(self, selector):
+        return _FakeFrameLocator(self.iframe_visible, self.clicks, "iframe")
+
+    def locator(self, selector):
+        visible = (
+            {"#challenge-stage input[type='checkbox']"} if self.stage_checkbox else set()
+        )
+        return _FakeLocator(selector in visible, self.clicks, f"page:{selector}")
+
+
+class TurnstileClickTest(unittest.TestCase):
+    """Клик по Cloudflare «Verify you are human» (Turnstile) — без браузера."""
+
+    def test_clicks_checkbox_inside_iframe(self):
+        page = _FakeTurnstilePage(iframe_checkbox=True)
+        sent = []
+
+        async def notify(text):
+            sent.append(text)
+
+        ok = asyncio.run(_click_turnstile(page, notify))
+        self.assertTrue(ok)
+        self.assertEqual(page.clicks, ["iframe:input[type='checkbox']"])
+        self.assertTrue(any("Verify you are human" in m for m in sent))
+
+    def test_clicks_managed_challenge_without_iframe(self):
+        page = _FakeTurnstilePage(stage_checkbox=True)
+        ok = asyncio.run(_click_turnstile(page))
+        self.assertTrue(ok)
+        self.assertEqual(page.clicks, ["page:#challenge-stage input[type='checkbox']"])
+
+    def test_returns_false_when_no_checkbox(self):
+        page = _FakeTurnstilePage()
+        ok = asyncio.run(_click_turnstile(page))
+        self.assertFalse(ok)
+        self.assertEqual(page.clicks, [])
+
+    def test_clicks_only_once_even_if_checkbox_stays(self):
+        page = _FakeTurnstilePage(iframe_checkbox=True)
+        self.assertTrue(asyncio.run(_click_turnstile(page)))
+        self.assertTrue(asyncio.run(_click_turnstile(page)))
+        # Хелпер делает один клик за вызов — повтор контролирует вызывающий цикл.
+        self.assertEqual(len(page.clicks), 2)
 
 
 if __name__ == "__main__":
