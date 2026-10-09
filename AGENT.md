@@ -49,7 +49,7 @@
 |---|---|
 | Вход «прошёл», но цикл не стартует | `./data/debug_after_login_unexpected_*.html` → если это дашборд `/account/` (`user-account-page`), значит `_looks_like_cabinet()` не распознал входную страницу |
 | Капча/антибот | маркеры в `UNEXPECTED_PAGE_MARKERS`, `_is_challenge_page`; дампы `debug_*captcha/challenge*` |
-| Cloudflare просит «Verify you are human» | `_click_turnstile()` (iframe `challenges.cloudflare.com` + `#challenge-stage`), вызывается из `_wait_for_login_form`/`_wait_challenge_passed` |
+| Cloudflare просит «Verify you are human» | `_click_turnstile()` — обход всех `page.frames` (домен Cloudflare / `blob:`), затем `iframe[id^='cf-chl-widget-']` + `#challenge-stage`; вызывается из `_wait_for_login_form`/`_wait_challenge_passed` |
 | «Форма входа не появилась» | `debug_login_form_missing_*.html`; селекторы `SEL_LOGIN_*`, таймаут `LOGIN_FORM_TIMEOUT_S` |
 | Заявки не берутся, хотя сессия жива | `./data/metrics.jsonl` (`saw_to_sent_ms`, `poll_rtt_ms`, `submit_rtt_ms`); `tools/metrics_report.py` |
 | Счётчик очереди расходится | сверка `DEMANDS_URL`, `resync_demand*s`, `/reset_session` |

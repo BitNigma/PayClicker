@@ -22,6 +22,7 @@ from app.browser_worker import (
     SEL_LOGIN_SUBMIT,
     _click_turnstile,
     _is_challenge_page,
+    _is_turnstile_frame_url,
     _looks_like_cabinet,
     _looks_like_login_form,
     ensure_logged_in,
@@ -497,13 +498,32 @@ class _FakeFrameLocator:
         )
 
 
+class _FakeFrame:
+    """Кадр (iframe) для проверки клика внутри Turnstile через page.frames."""
+
+    def __init__(self, url, checkbox_visible, log, prefix="frame"):
+        self.url = url
+        self._checkbox_visible = checkbox_visible
+        self._log = log
+        self._prefix = prefix
+
+    def locator(self, selector):
+        visible = self._checkbox_visible and selector == "input[type='checkbox']"
+        return _FakeLocator(visible, self._log, f"{self._prefix}:{selector}")
+
+    def get_by_role(self, role, **kwargs):
+        visible = self._checkbox_visible and role == "checkbox"
+        return _FakeLocator(visible, self._log, f"{self._prefix}:role={role}")
+
+
 class _FakeTurnstilePage:
     """Page-заглушка: iframe-виджет Turnstile и/или managed challenge без iframe."""
 
-    def __init__(self, iframe_checkbox=False, stage_checkbox=False):
+    def __init__(self, iframe_checkbox=False, stage_checkbox=False, frames=None):
         self.clicks = []
         self.iframe_visible = {"input[type='checkbox']"} if iframe_checkbox else set()
         self.stage_checkbox = stage_checkbox
+        self.frames = frames or []
 
     def frame_locator(self, selector):
         return _FakeFrameLocator(self.iframe_visible, self.clicks, "iframe")
@@ -535,6 +555,39 @@ class TurnstileClickTest(unittest.TestCase):
         ok = asyncio.run(_click_turnstile(page))
         self.assertTrue(ok)
         self.assertEqual(page.clicks, ["page:#challenge-stage input[type='checkbox']"])
+
+    def test_clicks_checkbox_in_turnstile_frame_by_url(self):
+        """Реальный managed challenge: чекбокс — во вложенном кадре
+        challenges.cloudflare.com. Клик находим через page.frames (а не
+        одноуровневым frame_locator, куда вложенный кадр не попадает)."""
+        log = []
+        frame = _FakeFrame("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/x", True, log)
+        page = _FakeTurnstilePage(frames=[frame])
+        ok = asyncio.run(_click_turnstile(page))
+        self.assertTrue(ok)
+        self.assertEqual(log, ["frame:role=checkbox"])
+
+    def test_ignores_frames_without_cloudflare_url(self):
+        log = []
+        frame = _FakeFrame("https://spark-trading.cash/account/payouts/", True, log)
+        page = _FakeTurnstilePage(frames=[frame])
+        ok = asyncio.run(_click_turnstile(page))
+        self.assertFalse(ok)
+        self.assertEqual(log, [])
+
+    def test_clicks_checkbox_in_blob_turnstile_frame(self):
+        """Turnstile-iframe бывает с blob:-URL (без домена Cloudflare) — тоже кликаем."""
+        log = []
+        frame = _FakeFrame("blob:https://spark-trading.cash/abc", True, log)
+        page = _FakeTurnstilePage(frames=[frame])
+        self.assertTrue(asyncio.run(_click_turnstile(page)))
+        self.assertEqual(log, ["frame:role=checkbox"])
+
+    def test_turnstile_frame_url_detection(self):
+        self.assertTrue(_is_turnstile_frame_url("https://challenges.cloudflare.com/x"))
+        self.assertTrue(_is_turnstile_frame_url("blob:https://x/abc"))
+        self.assertTrue(_is_turnstile_frame_url("about:blank"))
+        self.assertFalse(_is_turnstile_frame_url("https://spark-trading.cash/account/"))
 
     def test_returns_false_when_no_checkbox(self):
         page = _FakeTurnstilePage()

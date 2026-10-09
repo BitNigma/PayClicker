@@ -118,57 +118,138 @@ def _is_challenge_page(html: str) -> bool:
 # попробуют ещё раз на следующей итерации.
 # -------------------------------------------------------------------------
 TURNSTILE_IFRAME_SELECTORS = (
+    # Turnstile-виджет инжектится как iframe с id cf-chl-widget-<token>
+    # (рядом на странице есть скрытый input cf-chl-widget-<token>_response).
+    "iframe[id^='cf-chl-widget-']",
     "iframe[src*='challenges.cloudflare.com']",
     "iframe[src*='challenge-platform']",
     "iframe[title*='Cloudflare']",
     "iframe[title*='challenge']",
+    "iframe[title*='security']",
 )
 
-# Кандидаты-чекбоксы. Внутри iframe Turnstile это обычно input[type=checkbox]
-# (сам чекбокс) или кликабельный label; у managed challenge без iframe —
-# элементы внутри #challenge-stage.
+# Маркеры URL кадра Turnstile. По ним находим нужный iframe среди page.frames —
+# надёжнее CSS-селектора и работает на любой вложенности кадров.
+TURNSTILE_FRAME_URL_MARKERS = (
+    "challenges.cloudflare.com",
+    "challenge-platform",
+    "cdn-cgi/challenge-platform",
+)
+
+# Кандидаты-чекбоксы внутри виджета Turnstile. В разметке managed challenge
+# (cType: 'managed') классы рандомизированы, поэтому перебираем варианты,
+# включая доступную роль checkbox и контейнер проверки.
 TURNSTILE_CHECKBOX_SELECTORS = (
     "input[type='checkbox']",
+    ".cb-lb",
     ".ctp-checkbox-label",
-    "label[for*='checkbox']",
     "[role='checkbox']",
+    "label",
+    "#challenge-stage",
 )
+
+
+async def _try_click(locator, timeout: int = 2000) -> bool:
+    """Клик по локатору, если он существует; при перекрытии — force-клик.
+
+    Всё в try/except: локатор может «исчезнуть» при навигации/перерисовке
+    кадра. Возвращает True только при успешном клике.
+    """
+    try:
+        if not await locator.count():
+            return False
+    except Exception:
+        return False
+    try:
+        await locator.click(timeout=timeout)
+        return True
+    except Exception:
+        try:
+            await locator.click(timeout=timeout, force=True)
+            return True
+        except Exception:
+            return False
+
+
+def _is_turnstile_frame_url(url: str) -> bool:
+    """Похож ли URL кадра на Turnstile.
+
+    Обычно iframe виджета грузится с домена challenges.cloudflare.com, но иногда
+    содержимое рендерится через blob:/about:blank (без домена Cloudflare) — такие
+    кадры тоже считаем кандидатами, иначе клик не найдётся.
+    """
+    u = (url or "").lower()
+    if any(m in u for m in TURNSTILE_FRAME_URL_MARKERS):
+        return True
+    return u.startswith("blob:") or u in ("", "about:blank")
+
+
+async def _click_in_turnstile_frame(frame) -> bool:
+    """Кликает чекбокс внутри одного кадра Turnstile (по роли и по селекторам)."""
+    try:
+        if await _try_click(frame.get_by_role("checkbox").first):
+            return True
+    except Exception:
+        pass  # у некоторых кадров может не быть get_by_role
+    for cb_sel in TURNSTILE_CHECKBOX_SELECTORS:
+        try:
+            if await _try_click(frame.locator(cb_sel).first):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 async def _click_turnstile(page: Page, notify=None) -> bool:
     """Пробует нажать чекбокс Cloudflare «Verify you are human» (Turnstile).
 
-    Возвращает True, если удалось кликнуть (один раз); при неудаче — False,
-    чтобы вызывающий цикл попробовал снова на следующей итерации (виджет
-    может дорисоваться не сразу). Ошибки глушим — это не критичный шаг.
+    Порядок попыток:
+      1) перебираем ВСЕ кадры страницы (page.frames, включая вложенные iframe) и
+         кликаем в тех, чей URL относится к Cloudflare challenge;
+      2) если кадров нет — через frame_locator по селекторам iframe;
+      3) managed challenge без iframe — элементы прямо на странице (#challenge-stage).
+
+    Возвращает True, если удалось кликнуть; при неудаче — False, чтобы вызывающий
+    цикл попробовал снова (виджет дорисовывается не сразу). Ошибки глушим.
     """
     clicked = False
 
-    # 1) Чекбокс внутри iframe Turnstile (основной случай).
-    for frame_sel in TURNSTILE_IFRAME_SELECTORS:
-        for cb_sel in TURNSTILE_CHECKBOX_SELECTORS:
-            try:
-                box = page.frame_locator(frame_sel).locator(cb_sel).first
-                if await box.count() and await box.is_visible():
-                    await box.click(timeout=2000)
-                    clicked = True
-                    break
-            except Exception:
-                continue
-        if clicked:
+    # 1) Все кадры страницы (в т.ч. вложенные) — основной путь.
+    frames = getattr(page, "frames", None) or []
+    for frame in frames:
+        if not _is_turnstile_frame_url(getattr(frame, "url", "")):
+            continue
+        if await _click_in_turnstile_frame(frame):
+            clicked = True
             break
 
-    # 2) Managed challenge без iframe: чекбокс прямо в #challenge-stage.
+    # 2) Через frame_locator (если по кадрам не вышло).
+    if not clicked:
+        for frame_sel in TURNSTILE_IFRAME_SELECTORS:
+            try:
+                frame = page.frame_locator(frame_sel)
+            except Exception:
+                continue
+            for cb_sel in TURNSTILE_CHECKBOX_SELECTORS:
+                try:
+                    if await _try_click(frame.locator(cb_sel).first):
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if clicked:
+                break
+
+    # 3) Managed challenge без iframe: чекбокс прямо в #challenge-stage.
     if not clicked:
         for cb_sel in (
             "#challenge-stage input[type='checkbox']",
             "#challenge-stage [role='checkbox']",
             "#challenge-stage .ctp-checkbox-label",
+            "#challenge-stage",
         ):
             try:
-                box = page.locator(cb_sel).first
-                if await box.count() and await box.is_visible():
-                    await box.click(timeout=2000)
+                if await _try_click(page.locator(cb_sel).first):
                     clicked = True
                     break
             except Exception:

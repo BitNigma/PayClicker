@@ -69,11 +69,14 @@ python tools/metrics_report.py    # отчёт по ./data/metrics.jsonl
 - Пробуем открыть `QUEUE_URL`; если сессия жива — редиректа на `/signin` не будет.
 - Иначе: форма входа (`auth-form`) → логин/пароль → при необходимости 2FA через Telegram → сохранение `auth.json`.
 - Пережидаются Cloudflare-проверки (`_is_challenge_page`, `_wait_challenge_passed`) и «дребезг» URL (`_wait_url_settle`).
-- Интерактивную Cloudflare Turnstile «Verify you are human» бот **нажимает сам**:
-  `_click_turnstile()` кликает чекбокс через `frame_locator` внутрь iframe
-  `challenges.cloudflare.com` (плюс fallback на `#challenge-stage` для managed
-  challenge без iframe). Вызывается из `_wait_for_login_form` и
-  `_wait_challenge_passed` на каждой итерации ожидания — best-effort.
+- Интерактивную Cloudflare Turnstile «Verify you are human» (managed challenge,
+  `cType: 'managed'`) бот **нажимает сам**: `_click_turnstile()` ищет чекбокс,
+  перебирая **все кадры** (`page.frames`, в т.ч. вложенные iframe) с URL
+  `challenges.cloudflare.com`/`challenge-platform` или `blob:`/`about:blank`,
+  затем fallback через `frame_locator` (`iframe[id^='cf-chl-widget-']`) и
+  `#challenge-stage` для challenge без iframe. Клик — best-effort (force-клик при
+  перекрытии), один раз за проход. Вызывается из `_wait_for_login_form` и
+  `_wait_challenge_passed` на каждой итерации ожидания.
 - 🚨 **ГРАБЛИ (уже исправлялась)**: после успешного входа сайт часто уводит на дашборд
   `/account/` («личный кабинет», класс `user-account-page`), где нет таблицы выплат.
   `_looks_like_cabinet()` обязан считать такой дашборд кабинетом, иначе успешный вход
