@@ -41,6 +41,196 @@ STATUS_DONE_MARKER = "выполнена"   # если это есть в бей
 # ТУТ НУЖНО ЗАПОЛНИТЬ по странице выплат (payouts_choice) — пока заглушки:
 # =========================================================================
 
+# Маркеры, по которым понимаем, что сайт вместо ожидаемой страницы показал
+# антибот/капчу/«проверку человека» — это НЕ авторизация, и её нельзя считать успешной.
+UNEXPECTED_PAGE_MARKERS = (
+    "captcha-delivery.com",
+    "datadome",
+    "geo.captcha",
+    "hcaptcha",
+    "recaptcha",
+    "captcha",
+    "проверка, что вы не робот",
+    "вы не робот",
+    "verify you are human",
+    "are you a robot",
+    # Cloudflare-проверка «человек ли вы» перед сайтом (временная, но не является
+    # ожидаемой страницей кабинета/входа — по ней надо переждать, см. _wait_*).
+    "cf_chl_opt",
+    "challenge-platform",
+    "challenges.cloudflare.com",
+    "один момент",
+    "checking your browser",
+)
+
+
+def _looks_like_login_form(html: str) -> bool:
+    """Привычная разметка страницы входа: форма auth-form с email/pass."""
+    low = (html or "").lower()
+    return any(m in low for m in ("auth-form", "name='email'", 'name="email"', "name='pass'", 'name="pass"'))
+
+
+def _looks_like_cabinet(html: str) -> bool:
+    """Привычная разметка рабочей страницы кабинета (очередь выплат/demands).
+
+    Кроме таблицы выплат (payout-*) сюда входит и стартовая страница кабинета
+    «Дашборд» (/account/, класс user-account-page): именно на неё сайт чаще
+    всего уводит сразу после входа, а таблицы выплат там нет. Без этого маркера
+    успешный вход ошибочно признавался неудачей (дамп debug_after_login_unexpected),
+    из-за чего сессия не сохранялась и горячий цикл так и не запускался.
+    Маркер user-account-page не встречается на странице входа (там auth-form),
+    поэтому ложных срабатываний «мы в кабинете» на форме логина не даёт.
+    """
+    low = (html or "").lower()
+    return any(
+        m in low
+        for m in ("payout-table", "payout-card", "payout-status", "user-account-page")
+    )
+
+
+def _is_challenge_page(html: str) -> bool:
+    """Cloudflare-проверка «человек ли вы» перед сайтом (временная, ~20+ сек).
+
+    Это НЕ ошибка и НЕ «сменилась разметка» — это проверка перед /signin и кабинетом.
+    Её надо просто переждать, а не признавать неудачей и не снимать дамп.
+    """
+    low = (html or "").lower()
+    markers = (
+        "cf_chl_opt",
+        "challenge-platform",
+        "challenges.cloudflare.com",
+        "один момент",
+        "<title>один момент",
+        "verify you are human",
+        "checking your browser",
+    )
+    return any(m in low for m in markers)
+
+
+async def _wait_for_login_form(page: Page, cfg: Config, notify, timeout_s: int) -> bool:
+    """Ждём форму входа, пережидая Cloudflare-проверку и редиректы.
+
+    Вместо одного `wait_for_selector` опрашиваем раз в секунду: сайт перед /signin
+    нередко гоняет Cloudflare-проверку ~20+ секунд, и ожидание с меньшим таймаутом
+    успевает упасть до того, как форма реально появится. Ошибки "execution context
+    was destroyed" (страница перезагружается) — норма, пропускаем их.
+    """
+    notified_challenge = False
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        # 1. Форма уже есть?
+        try:
+            if await page.query_selector(SEL_LOGIN_INPUT):
+                return True
+        except Exception:
+            pass  # страница как раз перезагружается — смотрим в следующей итерации
+
+        # 2. Не Cloudflare ли сейчас? (это не ошибка, а пауза — ждём дальше)
+        try:
+            html = await page.content()
+            if _is_challenge_page(html) and not notified_challenge:
+                notified_challenge = True
+                await notify(
+                    "⏳ Сайт показывает Cloudflare-проверку «человек ли вы» перед входом. "
+                    f"Жду, пока пройдёт (до {timeout_s} сек)…"
+                )
+        except Exception:
+            pass  # контекст пересоздаётся — пропускаем
+
+        await asyncio.sleep(1)
+
+    # Последняя проверка перед тем, как признать неудачу: форма могла появиться
+    # в момент, когда мы уже вышли из while.
+    try:
+        if await page.query_selector(SEL_LOGIN_INPUT):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _wait_challenge_passed(page: Page, cfg: Config, notify, timeout_s: int = 90) -> None:
+    """Если после goto открылась Cloudflare-проверка, дожидаемся её окончания.
+
+    Возвращаемся только когда проверка прошла (или истёк таймаут). Тогда сайт
+    редиректит либо в кабинет, либо на /signin — и по нему уже можно решать.
+    """
+    notified = False
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            html = await page.content()
+        except Exception:
+            try:
+                await asyncio.sleep(1)
+                continue
+            except Exception:
+                continue
+        if not _is_challenge_page(html):
+            return
+        if not notified:
+            notified = True
+            await notify(
+                "⏳ Сайт показывает Cloudflare-проверку. Дожидаюсь, пока она пройдёт…"
+            )
+        await asyncio.sleep(1)
+
+
+async def _wait_url_settle(page: Page, max_wait_ms: int = 15000) -> str:
+    """Ждём, пока URL перестанет меняться (SPA, редиректы после логина).
+
+    Старая версия верила странице сразу после domcontentloaded — из-за медленных
+    редиректов бот «не видел» /signin и ошибочно писал «сессия активна».
+    """
+    deadline = time.monotonic() + max_wait_ms / 1000
+    last_url = page.url
+    stable_ticks = 0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.2)
+        if page.url != last_url:
+            last_url = page.url
+            stable_ticks = 0
+        else:
+            stable_ticks += 1
+            if stable_ticks >= 3:  # ~0.6 с без смены URL
+                break
+    return page.url
+
+
+async def _send_debug_dump(page: Page, cfg: Config, notify, notify_file, name: str, caption: str) -> str:
+    """Скриншот + HTML текущей страницы: сохраняет в ./data и отправляет оба файла админу.
+
+    Нужно, чтобы при изменившейся разметке/капче можно было посмотреть в Telegram,
+    что именно бот увидел вместо ожидаемой страницы.
+    """
+    d = Path(cfg.log_path).parent
+    d.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    png_path = d / f"debug_{name}_{ts}.png"
+    html_path = d / f"debug_{name}_{ts}.html"
+    page_url = page.url
+    try:
+        await page.screenshot(path=str(png_path), full_page=True)
+    except Exception:
+        logger.exception("screenshot в debug-дампе не удался")
+    try:
+        html = await page.content()
+        html_path.write_text(html, encoding="utf-8")
+    except Exception:
+        logger.exception("html в debug-дампе не удался")
+        html = ""
+    await notify(f"{caption}\nURL: {page_url}\nФайлы: {html_path.name}, {png_path.name}")
+    if notify_file is not None:
+        try:
+            await notify_file(str(html_path), f"HTML [{name}] — для анализа разметки")
+        except Exception:
+            logger.exception("не удалось отправить HTML-дамп в Telegram")
+        try:
+            await notify_file(str(png_path), f"Скриншот [{name}]")
+        except Exception:
+            logger.exception("не удалось отправить скриншот в Telegram")
+    return html
+
 
 async def _send_live_snapshot(page: Page, cfg: Config, notify, notify_file, label: str):
     """Мгновенный снимок того, что бот видит СЕЙЧАС: скриншот + HTML + URL.
@@ -117,29 +307,122 @@ def _on_signin(page: Page) -> bool:
     return "/signin" in page.url
 
 
-async def ensure_logged_in(page: Page, context: BrowserContext, cfg: Config, account, ws, notify) -> bool:
-    # Пробуем открыть рабочую страницу: если сессия жива, редиректа на /signin не будет
+async def ensure_logged_in(
+    page: Page,
+    context: BrowserContext,
+    cfg: Config,
+    account,
+    ws,
+    notify,
+    notify_file=None,
+) -> bool:
+    # Пробуем открыть рабочую страницу: если сессия жива, редиректа на /signin не будет.
+    # ВАЖНО: не верим первому URL — ждём, пока адрес перестанет меняться (медленный
+    # редирект на /signin стоит сайте пол-секунды, и мы обязаны его дождаться).
+    login_timeout = getattr(cfg, "login_form_timeout_s", 90)
     await page.goto(cfg.queue_url, wait_until="domcontentloaded")
-    await page.wait_for_timeout(1500)
+    await _wait_url_settle(page)
     if not _on_signin(page):
-        ws.logged_in = True
-        await notify("✅ Сессия активна, повторная авторизация не нужна.")
-        return True
+        # Вне /signin — но точно ли мы в кабинете? Сайт перед /signin может сначала
+        # показать Cloudflare-проверку «Один момент…» и кратковременную страницу
+        # редиректа/загрузки, а форму входа «дорисовать» чуть позже. Поэтому читать
+        # разметку один раз нельзя — на мгновенной «заглушке» получится ложный дамп
+        # unexpected_after_queue, хотя на деле открывалась обычная форма входа
+        # (см. debug_unexpected_after_queue_*.html с формой «Авторизация»).
+        # Ждём, пока страница не превратится в кабинет, форму входа, URL /signin
+        # или (по истечении таймаута) в действительно неожиданную разметку.
+        deadline = time.monotonic() + login_timeout
+        resolved = False
+        while time.monotonic() < deadline and not resolved:
+            try:
+                html = await page.content()
+            except Exception:
+                html = ""
+            if _looks_like_cabinet(html):
+                ws.logged_in = True
+                await notify("✅ Сессия активна, повторная авторизация не нужна.")
+                return True
+            if _looks_like_login_form(html):
+                resolved = True          # открылась форма входа — идём в flow логина
+                break
+            if _is_challenge_page(html):
+                # Cloudflare-проверку пережидаем, потом заново оцениваем страницу.
+                await _wait_challenge_passed(page, cfg, notify, login_timeout)
+                continue
+            if _on_signin(page):          # редирект на /signin — там форма входа
+                resolved = True
+                break
+            await asyncio.sleep(1)
+        if not resolved:
+            # Таймаут: ни кабинета, ни формы так и не появилось. Пере-проверяем
+            # один раз (форма могла «доехать» ровно при выходе из цикла) и только
+            # тогда признаём неудачу и шлём дамп.
+            try:
+                html = await page.content()
+            except Exception:
+                html = ""
+            if _looks_like_cabinet(html):
+                ws.logged_in = True
+                await notify("✅ Сессия активна, повторная авторизация не нужна.")
+                return True
+            if _on_signin(page) or _looks_like_login_form(html):
+                resolved = True
+            else:
+                await _send_debug_dump(
+                    page,
+                    cfg,
+                    notify,
+                    notify_file,
+                    "unexpected_after_queue",
+                    "⚠️ После открытия рабочего URL сайт показал неожиданную разметку "
+                    "(не кабинет и не форма входа) — возможно капча/антибот или сайт изменился. "
+                    "Присылаю HTML и скриншот. Сессия НЕ считается успешной.",
+                )
+                return False
 
     await notify("🔐 Начинаю авторизацию на сайте...")
     await page.goto(cfg.site_url, wait_until="domcontentloaded")
+    # Дожидаемся именно формы входа, пережидая Cloudflare-проверку и редиректы.
+    # Если сайт стал грузиться дольше или разметка сменилась — только тогда дамп.
+    if not await _wait_for_login_form(page, cfg, notify, login_timeout):
+        await _send_debug_dump(
+            page,
+            cfg,
+            notify,
+            notify_file,
+            "login_form_missing",
+            f"⚠️ Форма входа не появилась за {login_timeout} секунд — страница "
+            "авторизации не догрузилась или изменилась. Присылаю HTML и скриншот для разбора.",
+        )
+        return False
+
+    # Для диагностики всегда присылаем HTML/скриншот страницы авторизации.
+    await _send_debug_dump(
+        page,
+        cfg,
+        notify,
+        notify_file,
+        "login_page_dump",
+        "🔐 Страница авторизации (HTML-дамп для проверки).",
+    )
     try:
         await page.fill(SEL_LOGIN_INPUT, account.login, timeout=10000)
         await page.fill(SEL_PASSWORD_INPUT, account.password, timeout=10000)
         await page.click(SEL_LOGIN_SUBMIT, timeout=10000)
     except Exception as e:
-        await _dump_debug(page, cfg, "login_form")
-        await notify(f"⚠️ Не удалось заполнить форму входа: {e}\nСмотри ./data/debug_login_form.png/.html")
+        await _send_debug_dump(
+            page,
+            cfg,
+            notify,
+            notify_file,
+            "login_form",
+            f"⚠️ Не удалось заполнить форму входа: {e}",
+        )
         return False
 
     # Ждём: либо уйдём со /signin (без 2FA), либо появится поле кода
     code_input = None
-    for _ in range(30):  # ~15 сек
+    for _ in range(40):  # ~20 сек
         await page.wait_for_timeout(500)
         if not _on_signin(page):
             break
@@ -149,6 +432,19 @@ async def ensure_logged_in(page: Page, context: BrowserContext, cfg: Config, acc
                 break
         except Exception:
             continue  # страница как раз перезагружается — повторим на следующей итерации
+    else:
+        # Всё ещё на /signin и кода нет — вероятно, неправильный пароль или ошибка на форме.
+        await _send_debug_dump(
+            page,
+            cfg,
+            notify,
+            notify_file,
+            "after_login_still_signin",
+            "⚠️ После отправки логина/пароля мы так и остались на странице входа "
+            "(кода 2FA тоже нет). Скорее всего неверный пароль или сайт показал ошибку. "
+            "Присылаю HTML и скриншот.",
+        )
+        return False
 
     if code_input:
         await notify("📲 Введите код 2FA ответным сообщением в этот чат (5 минут).")
@@ -160,8 +456,14 @@ async def ensure_logged_in(page: Page, context: BrowserContext, cfg: Config, acc
         try:
             await page.fill(SEL_2FA_INPUT, code, timeout=10000)
         except Exception as e:
-            await _dump_debug(page, cfg, "2fa_form")
-            await notify(f"⚠️ Ошибка при вводе 2FA: {e}\nСмотри ./data/debug_2fa_form.png/.html")
+            await _send_debug_dump(
+                page,
+                cfg,
+                notify,
+                notify_file,
+                "2fa_form",
+                f"⚠️ Ошибка при вводе 2FA: {e}",
+            )
             return False
 
         # Сайт может сам отправить форму сразу после ввода кода ("Проверка кода...")
@@ -178,15 +480,39 @@ async def ensure_logged_in(page: Page, context: BrowserContext, cfg: Config, acc
             pass
 
     # Если сайт остался на /signin, хотя код принят — сессия обычно уже создана.
-    # Принудительно открываем рабочую страницу и проверяем ещё раз.
+    # Принудительно открываем рабочую страницу, ждём стабилизации и проверяем.
     if _on_signin(page):
         await page.goto(cfg.queue_url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(1500)
+        await _wait_url_settle(page)
 
     if _on_signin(page):
-        await _dump_debug(page, cfg, "after_login")
-        await notify("❌ Всё ещё на странице входа: неверный пароль/код или другие селекторы. "
-                     "Смотри ./data/debug_after_login.png/.html")
+        await _send_debug_dump(
+            page,
+            cfg,
+            notify,
+            notify_file,
+            "after_login",
+            "❌ Всё ещё на странице входа: неверный пароль/код или другие селекторы. "
+            "Присылаю HTML и скриншот.",
+        )
+        return False
+
+    # Финальная страховка: ушли с /signin, но точно ли открылся кабинет, а не капча?
+    try:
+        html = await page.content()
+    except Exception:
+        html = ""
+    if not _looks_like_cabinet(html) and not _looks_like_login_form(html):
+        await _send_debug_dump(
+            page,
+            cfg,
+            notify,
+            notify_file,
+            "after_login_unexpected",
+            "⚠️ Ушли со страницы входа, но разметка не похожа на кабинет — вероятно "
+            "капча/антибот/промежуточная страница. Сессия НЕ считается успешной. "
+            "Присылаю HTML и скриншот.",
+        )
         return False
 
     Path(account.storage_state_path).parent.mkdir(parents=True, exist_ok=True)
@@ -196,7 +522,7 @@ async def ensure_logged_in(page: Page, context: BrowserContext, cfg: Config, acc
     return True
 
 
-async def login_via_browser(cfg: Config, account, ws, notify) -> bool:
+async def login_via_browser(cfg: Config, account, ws, notify, notify_file=None) -> bool:
     """Разовая браузерная авторизация (в т.ч. 2FA) — нужна ТОЛЬКО чтобы получить
     и обновить cookies кабинета в его storage_state_path для HTTP-горячего цикла
     (http_worker). Сам горячий цикл браузер не использует.
@@ -209,16 +535,16 @@ async def login_via_browser(cfg: Config, account, ws, notify) -> bool:
     if lock.locked():
         await notify("⏳ Другой кабинет сейчас авторизуется — жду своей очереди...")
     async with lock:
-        return await _login_via_browser_locked(cfg, account, ws, notify)
+        return await _login_via_browser_locked(cfg, account, ws, notify, notify_file)
 
 
-async def _login_via_browser_locked(cfg: Config, account, ws, notify) -> bool:
+async def _login_via_browser_locked(cfg: Config, account, ws, notify, notify_file=None) -> bool:
     """Сама авторизация; вызывать только под _login_lock()."""
     async with async_playwright() as pw:
         browser, context = await _build_context(pw, cfg, account)
         try:
             page = await context.new_page()
-            return await ensure_logged_in(page, context, cfg, account, ws, notify)
+            return await ensure_logged_in(page, context, cfg, account, ws, notify, notify_file)
         finally:
             await browser.close()
 
@@ -772,6 +1098,9 @@ async def run_worker(cfg: Config, account, ws, notify, notify_file):
     async def acct_notify(text: str):
         await notify(f"[{account.name}] {text}")
 
+    async def acct_notify_file(path: str, caption: str = ""):
+        await notify_file(path, f"[{account.name}] {caption}".strip())
+
     async with async_playwright() as pw:
         browser, context = await _build_context(pw, cfg, account)
         page = await context.new_page()            # логин и режим watch
@@ -784,7 +1113,7 @@ async def run_worker(cfg: Config, account, ws, notify, notify_file):
                 continue
 
             if not ws.logged_in:
-                ok = await ensure_logged_in(page, context, cfg, account, ws, acct_notify)
+                ok = await ensure_logged_in(page, context, cfg, account, ws, acct_notify, acct_notify_file)
                 if not ok:
                     ws.running = False
                     continue

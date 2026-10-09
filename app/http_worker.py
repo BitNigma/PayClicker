@@ -295,9 +295,11 @@ async def _session_ok(client: PayoutClient) -> bool:
         return False
 
 
-async def ensure_session(cfg: Config, account, ws: WorkerState, notify) -> dict | None:
+async def ensure_session(cfg: Config, account, ws: WorkerState, notify, notify_file=None) -> dict | None:
     """Возвращает рабочие cookies кабинета. Если сохранённые не годятся — разово
-    поднимает браузер, чтобы обновить auth.json кабинета (вне горячего цикла)."""
+    поднимает браузер, чтобы обновить auth.json кабинета (вне горячего цикла).
+    notify_file пробрасывается в браузерную авторизацию, чтобы HTML-дампы
+    проблемных страниц уходили прямо в Telegram."""
     cookies = load_cookies(account)
     if cookies:
         probe = PayoutClient(cfg, cookies)
@@ -310,7 +312,7 @@ async def ensure_session(cfg: Config, account, ws: WorkerState, notify) -> dict 
     await notify("🔐 Cookies недействительны — разовая браузерная авторизация (вне горячего цикла)...")
     from .browser_worker import login_via_browser  # локальный импорт: браузер нужен только тут
 
-    ok = await login_via_browser(cfg, account, ws, notify)
+    ok = await login_via_browser(cfg, account, ws, notify, notify_file)
     if not ok:
         return None
     return load_cookies(account) or None
@@ -816,7 +818,7 @@ async def run_worker(cfg: Config, account, ws: WorkerState, notify, notify_file)
             continue
 
         try:
-            cookies = await ensure_session(cfg, account, ws, acct_notify)
+            cookies = await ensure_session(cfg, account, ws, acct_notify, acct_notify_file)
         except BlockedError as exc:
             await acct_notify(f"⛔ {exc}")
             ws.running = False

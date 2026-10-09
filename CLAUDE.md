@@ -1,0 +1,116 @@
+# CLAUDE.md — контекст проекта Order Queue Bot
+
+> Этот файл помогает агенту быстро войти в контекст, не перечитывая весь репозиторий.
+> Источник правды по функциональности — `README.md` (он подробный). Здесь — сжатая
+> карта проекта, команды, ключевые потоки и «грабли».
+
+## Что это
+
+Бот держит в активной очереди N заявок на выплату на сайте `spark-trading.cash`:
+следит за очередью, мгновенно «забирает» заявки (POST формы `take_payout`), довзятие
+через периодический опрос. Управление — из Telegram (`/run`, `/stop`, `/watch`,
+`/status`, проброс 2FA). Поддерживает несколько кабинетов (аккаунтов) параллельно.
+
+Главная цель оптимизаций — **минимизировать задержку обнаружения заявки**. Поэтому
+горячий цикл работает на `httpx` (без браузера), а Playwright используется только для
+разовой авторизации (получить cookies в `auth.json`).
+
+## Быстрые команды
+
+```bash
+# зависимости (локально)
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt && playwright install chromium
+
+# запуск
+cp .env.example .env      # заполнить
+python -m app.main        # или: docker compose up --build
+
+# тесты (офлайн, из корня проекта)
+python -m unittest discover -s tests -t .
+python -m unittest tests.test_browser_auth -v
+
+# утилиты
+python tools/check_accounts.py    # какие кабинеты прочитались, пути сессий
+python tools/metrics_report.py    # отчёт по ./data/metrics.jsonl
+
+# деплой на Hostinger (см. README → «Деплой»)
+./deploy.sh
+```
+
+## Карта кода (`app/`)
+
+| файл | роль |
+|---|---|
+| `main.py` | точка входа: config → bot app → по воркеру на каждый кабинет (`notify`/`notify_file` прокидываются сюда) |
+| `config.py` | чтение env → `Config`/`Account`; парсинг админов и мультиаккаунта |
+| `state.py` | `WorkerState` (по одному на кабинет) + `BotState` (общий `state`); делегирует старые однокабинетные атрибуты в #1 |
+| `telegram_bot.py` | обработчики команд, диалоги выбора кабинета, маршрутизация 2FA |
+| `http_worker.py` | **ГОРЯЧИЙ ЦИКЛ** на httpx: `run_worker`, `take_loop`, `watch_loop`, `PayoutClient`, парсер HTML, `Metrics` |
+| `browser_worker.py` | Playwright: разовая авторизация (`login_via_browser`, `ensure_logged_in`) + старый browser-цикл (fallback) |
+
+## Поток: от Telegram до заявки
+
+1. `main.py` строит `Application`, запускает polling и по одному `run_worker(cfg, account, ws, notify, notify_file)` на кабинет (задача живёт постоянно).
+2. Админ шлёт `/run` (с выбором кабинета) → `telegram_bot.cmd_run` ставит `ws.running=True`, `ws.mode="take"`.
+3. `http_worker.run_worker` видит `ws.running` → `ensure_session` (cookies из `auth.json`; если протухли — разовая браузерная авторизация) → `PayoutClient`.
+4. `take_loop`: `TAKE_PARALLEL_POLLERS` воронок делают `GET QUEUE_URL`, парсят HTML регулярками (`parse_rows`), и одним «такт»-ом делают `POST` формы `take_payout`, не блокируя цикл.
+5. `demands_loop`/`resync_demands_loop` раз в `DEMANDS_SYNC_S` сверяются со страницей `DEMANDS_URL` — это **источник правды о занятых слотах** (автовыдача, заявки с прошлого запуска).
+
+## Источник правды о размере очереди
+
+`TARGET_QUEUE_SIZE` считается НЕ по памяти бота, а по странице `DEMANDS_URL`:
+слот занят, если статус заявки — «в работе у провайдера» (`STATUS_IN_WORK_MARKER`).
+Память (`taken_order_ids`) живёт только до рестарта, а часть заявок площадка выдаёт
+сама. См. `WorkerState.slots_taken`, `ws.demands_ids`.
+
+## Авторизация (только в browser_worker)
+
+- Пробуем открыть `QUEUE_URL`; если сессия жива — редиректа на `/signin` не будет.
+- Иначе: форма входа (`auth-form`) → логин/пароль → при необходимости 2FA через Telegram → сохранение `auth.json`.
+- Пережидаются Cloudflare-проверки (`_is_challenge_page`, `_wait_challenge_passed`) и «дребезг» URL (`_wait_url_settle`).
+- 🚨 **ГРАБЛИ (уже исправлялась)**: после успешного входа сайт часто уводит на дашборд
+  `/account/` («личный кабинет», класс `user-account-page`), где нет таблицы выплат.
+  `_looks_like_cabinet()` обязан считать такой дашборд кабинетом, иначе успешный вход
+  помечается как неудача (`debug_after_login_unexpected`), сессия не сохраняется и
+  горячий цикл не стартует. Маркер `user_dashboard` НЕ подходит — он есть и на
+  странице входа (в путях ассетов).
+
+## Мультиаккаунт
+
+- Кабинет #1: `SITE_LOGIN`/`SITE_PASSWORD`/`SITE_NAME`, сессия `STORAGE_STATE_PATH` (`./data/auth.json`).
+- Кабинет N: `SITE_LOGIN_N`/`SITE_PASSWORD_N`/`SITE_NAME_N`, сессия `./data/auth_N.json`.
+- Авторизации и 2FA идут строго по одной (`_login_lock`), горячие циклы — параллельны.
+- `WORKER_BACKEND=browser` поддерживает только кабинет #1.
+
+## Переменные окружения (ключевые)
+
+`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID` (+ `TELEGRAM_ADMIN_IDS`/`SUB_USER`…),
+`SITE_LOGIN[_N]`, `SITE_PASSWORD[_N]`, `SITE_NAME[_N]`, `SITE_URL`, `QUEUE_URL`,
+`DEMANDS_URL`, `TARGET_QUEUE_SIZE`, `RELOAD_MIN_MS/MAX_MS`, `TAKE_POLL_MIN_MS/MAX_MS`,
+`TAKE_PARALLEL_POLLERS`, `DEMANDS_SYNC_S`, `LOGIN_FORM_TIMEOUT_S`, `WORKER_BACKEND`
+(`http`|`browser`), `HTTP_TIMEOUT_S`, `DEBUG_CAPTURE_ATTEMPTS`, `HEADLESS`,
+`STORAGE_STATE_PATH`, `LOG_PATH`, `METRICS_PATH`.
+Полный список и комментарии — `.env.example`.
+
+> `load_dotenv()` **не перезаписывает** уже заданные env-переменные. Залипшие
+> `export SITE_LOGIN_2=…` из терминала перебьют `.env` — снимайте `unset`/чистый терминал
+> (см. `tools/check_accounts.py`).
+
+## Тесты
+
+- `tests/test_browser_auth.py` — логика авторизации без браузера (fake Page/Context): `_looks_like_*`, `ensure_logged_in`.
+- `tests/test_http_worker.py` — парсер строк, `PayoutClient`, учёт слотов demands (часть тестов на реальных дампах из `./data`, иначе `skipUnless`).
+- `tests/test_config.py` — env → Config/Account/админы.
+- `tests/test_telegram_flow.py` — обработчики команд.
+Все тесты офлайновые; сеть не нужна.
+
+## Конвенции и «грабли»
+
+- Комментарии/строки/докстринги — на русском, как в проекте. Сообщения Telegram — с префиксом кабинета `[Имя] …`.
+- HTML парсится **регулярками** (`http_worker`), без BeautifulSoup/DOM.
+- Задержку обнаружения дают: пауза между опросами + RTT; POST уходит фоновой задачей.
+- Дампы при ошибках — в `./data/debug_*.html|png` (+ версии с timestamp). Смотреть сюда при разборе «что показал сайт».
+- Дампы/логи/сессии в `./data` — в `.gitignore`; чистить `./deploy.sh prune`.
+- `.env` и `./data/auth*.json` = живые секреты, в git не коммитить.
+- Изменения логики авторизации обязательно покрывать тестами в `test_browser_auth.py`.

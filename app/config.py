@@ -50,6 +50,9 @@ class Config:
     take_parallel_pollers: int
     # как часто (сек) сверяемся со страницей demands: сколько заявок в работе
     demands_sync_s: int = 10
+    # сколько секунд ждать форму входа при авторизации. Cloudflare-проверка
+    # перед /signin может занимать ~20+ секунд, поэтому ждать нужно с запасом.
+    login_form_timeout_s: int = 90
 
     @property
     def allowed_chat_id(self) -> int:
@@ -194,5 +197,7 @@ def load_config() -> Config:
         take_parallel_pollers=int(env.get("TAKE_PARALLEL_POLLERS", "1")),
         # как часто (сек) сверяемся со страницей demands: истина о занятых слотах
         demands_sync_s=max(1, int(env.get("DEMANDS_SYNC_S", "10"))),
+        # сколько секунд ждать форму входа (с учётом Cloudflare-проверки перед /signin)
+        login_form_timeout_s=max(1, int(env.get("LOGIN_FORM_TIMEOUT_S", "90"))),
     )
 
