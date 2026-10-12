@@ -57,6 +57,11 @@ class WorkerState:
     predictive_sent: set = field(default_factory=set)
     # Сколько окон подряд не дали ни одной заявки (для анти-шума / диагностики).
     predictive_rounds: int = 0
+    # id предсказанных взятий, которые ПРЯМО СЕЙЧАС в полёте (спекулятивные).
+    # Они НЕ считаются «занятыми слотами» для опроса очереди: иначе пачка
+    # предсказаний на секунду «забивает» все слоты, горячий цикл считает очередь
+    # полной и перестаёт видеть реальную очередь (см. _poll_loop/predict_loop).
+    predicted_inflight: set = field(default_factory=set)
 
     # Канал, через который телеграм-бот прокидывает введённый 2FA-код в воркер
     two_fa_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -71,13 +76,17 @@ class WorkerState:
     def submit_2fa_code(self, code: str) -> None:
         self.two_fa_queue.put_nowait(code)
 
-    def slots_taken(self, inflight=()) -> int:
-        """Сколько слотов целевой очереди занято прямо сейчас.
+    def slots_taken(self, inflight=(), speculative=()) -> int:
+        """Сколько РЕАЛЬНЫХ слотов целевой очереди занято прямо сейчас.
 
         Объединяем три источника: заявки «в работе» на площадке (`demands_ids`),
         взятые в этой сессии (`taken_order_ids`) и отправленные, но ещё не
         подтверждённые (`inflight`). Дедуп по id, поэтому счёт корректен и когда
         сверка со страницей demands недоступна (тогда работаем по памяти).
+
+        `speculative` — id предсказанных (спекулятивных) отправок: их вычитаем,
+        чтобы пачка предсказаний не выглядела как «занятые слоты» и не замораживала
+        опрос реальной очереди. См. WorkerState.predicted_inflight.
 
         Пока идёт ресинхронизация после /reset_session — возвращаем 0, чтобы
         воркер не начал брать заявки на основании пустого (ещё не сверенного)
@@ -85,7 +94,8 @@ class WorkerState:
         """
         if self.resync_required:
             return 0
-        return len(self.demands_ids | self.taken_order_ids | set(inflight))
+        committed = set(inflight) - set(speculative)
+        return len(self.demands_ids | self.taken_order_ids | committed)
 
     def reset_queue_cache(self) -> None:
         """Полная очистка локального кэша очереди кабинета (команда /reset_session).

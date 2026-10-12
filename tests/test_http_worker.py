@@ -23,11 +23,18 @@ from app.http_worker import (
     BlockedError,
     Metrics,
     PayoutClient,
+    TAKE_REPLY_GONE,
+    TAKE_REPLY_STILL_AVAILABLE,
+    TAKE_REPLY_TAKEN,
+    TAKE_REPLY_UNKNOWN,
     _classify,
+    _classify_take_response,
+    _dump_take_request,
     _fire_predicted_window,
     _observe_queue,
     _recover_from_block,
     _reset_stored_session,
+    _safe_text,
     in_work_ids,
     load_cookies,
     parse_rows,
@@ -184,6 +191,131 @@ class BlockedResponseTest(unittest.TestCase):
     def test_normal_page_passes(self):
         # Не должно бросать исключение.
         self._check(self._resp(200, "<table class='payout-table'></table>"))
+
+
+class ClassifyTakeResponseTest(unittest.TestCase):
+    """Разбор ТЕЛА ответа на POST take_payout: отличить «взяли» от «нет заявки».
+
+    Это диагностика к уведомлению; окончательное решение о взятии даёт сверка с
+    demands (_confirm_taken), но понять ответ сервера мы обязаны.
+    """
+
+    def _cfg(self, **kw):
+        return make_config(**kw)
+
+    def test_gone_by_marker(self):
+        cfg = self._cfg(take_gone_markers=("заявка не найдена", "уже взята"))
+        html = "<html><body><div>Заявка не найдена</div></body></html>"
+        self.assertEqual(_classify_take_response(html, "6452828", cfg), TAKE_REPLY_GONE)
+
+    def test_taken_by_marker(self):
+        cfg = self._cfg(take_success_markers=("успешно взята",))
+        html = "<html><body><div>Заявка успешно взята</div></body></html>"
+        self.assertEqual(_classify_take_response(html, "6452828", cfg), TAKE_REPLY_TAKEN)
+
+    def test_gone_marker_has_priority(self):
+        cfg = self._cfg(take_success_markers=("взята",), take_gone_markers=("уже взята",))
+        html = "<html><body>Заявка уже взята</body></html>"
+        self.assertEqual(_classify_take_response(html, "6452828", cfg), TAKE_REPLY_GONE)
+
+    def test_taken_when_row_is_in_work(self):
+        # В ответе осталась строка этого id со статусом «в работе у провайдера».
+        cfg = self._cfg()
+        html = _page_html(_row_html("6452828", "В работе у провайдера"))
+        self.assertEqual(_classify_take_response(html, "6452828", cfg), TAKE_REPLY_TAKEN)
+
+    def test_still_available_when_take_form_present(self):
+        # Заявка всё ещё предлагается к взятию → наш POST не сработал.
+        cfg = self._cfg()
+        html = _page_html(_row_html("6452828", "Ждет провайдера"))
+        self.assertEqual(
+            _classify_take_response(html, "6452828", cfg), TAKE_REPLY_STILL_AVAILABLE
+        )
+
+    def test_unknown_when_id_absent(self):
+        cfg = self._cfg()
+        html = _page_html(_row_html("9999999", "Ждет провайдера"))
+        self.assertEqual(_classify_take_response(html, "6452828", cfg), TAKE_REPLY_UNKNOWN)
+
+    def test_only_matches_requested_id(self):
+        cfg = self._cfg()
+        html = _page_html(
+            _row_html("6452828", "Ждет провайдера"),
+            _row_html("6452829", "В работе у провайдера"),
+        )
+        # Форма осталась именно у нашей заявки — значит её мы не взяли.
+        self.assertEqual(
+            _classify_take_response(html, "6452828", cfg), TAKE_REPLY_STILL_AVAILABLE
+        )
+        # А у 6452829 статус «в работе» → считаем взятой.
+        self.assertEqual(_classify_take_response(html, "6452829", cfg), TAKE_REPLY_TAKEN)
+
+
+class DumpTakeRequestTest(unittest.TestCase):
+    """Дамп POST-запроса должен содержать и ТЕЛО ответа — чтобы вручную видеть
+    разницу между «взяли» и «такой заявки нет»."""
+
+    def _dump(self, body: str, order_id: str = "6452828", server_reply=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(log_path=str(Path(tmp) / "actions.log"))
+            response = httpx.Response(
+                200,
+                request=httpx.Request("POST", cfg.queue_url),
+                text=body,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+            fp = _dump_take_request(
+                cfg,
+                order_id,
+                {"csrf_token": "tok", "act": "take_payout", "payout_id": order_id, "access_key": ""},
+                response,
+                server_reply,
+            )
+            return json.loads(fp.read_text(encoding="utf-8")), fp.name
+
+    def test_saves_response_body_and_order_id(self):
+        payload, name = self._dump("<html>OK заявка взята</html>", server_reply=TAKE_REPLY_TAKEN)
+        self.assertIn("6452828", name)
+        self.assertEqual(payload["response"]["status"], 200)
+        self.assertIn("OK заявка взята", payload["response"]["text_head"])
+        self.assertIn("payout_id=6452828", payload["request"]["post_data"])
+        # Вердикт разбора ответа тоже попадает в дамп.
+        self.assertEqual(payload["response"]["server_reply"], TAKE_REPLY_TAKEN)
+
+    def test_truncates_long_body(self):
+        payload, _ = self._dump("X" * 10000)
+        self.assertEqual(len(payload["response"]["text_head"]), 4000)
+
+    def test_handles_non_text_response(self):
+        # Тело, которое нельзя декодировать как текст, не должно ронять дамп.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(log_path=str(Path(tmp) / "actions.log"))
+            response = httpx.Response(
+                200,
+                request=httpx.Request("POST", cfg.queue_url),
+                content=b"\xff\xfe\x00\x01",
+            )
+            fp = _dump_take_request(
+                cfg, "1", {"csrf_token": "t", "act": "take_payout", "payout_id": "1", "access_key": ""}, response
+            )
+            self.assertTrue(fp.exists())
+
+    def test_safe_text_returns_body_for_normal_response(self):
+        resp = httpx.Response(
+            200, request=httpx.Request("POST", "https://x/"), text="<html>ок</html>"
+        )
+        self.assertEqual(_safe_text(resp), "<html>ок</html>")
+
+    def test_safe_text_falls_back_when_text_raises(self):
+        # Если .text бросает (битая кодировка), _safe_text декодирует content грубо.
+        class Boom:
+            @property
+            def text(self):
+                raise UnicodeDecodeError("ascii", b"x", 0, 1, "boom")
+
+            content = "привет".encode("utf-8")
+
+        self.assertEqual(_safe_text(Boom()), "привет")
 
 
 class ResetStoredSessionTest(unittest.TestCase):
@@ -356,6 +488,156 @@ class PredictiveTakeTest(unittest.TestCase):
                 await predict_loop(None, cfg, account, ws, None, None, set(), set())
         asyncio.run(run())
         self.assertEqual(ws.predictive_rounds, 0)  # успех сбрасывает счётчик
+
+    def test_slots_taken_excludes_speculative(self):
+        """Спекулятивные (предсказанные) отправки не считаются занятыми слотами."""
+        ws = WorkerState(index=1, name="К")
+        ws.demands_ids = {"100"}
+        inflight = {"101", "102"}  # 101 — реальная отправка, 102 — предсказание
+        self.assertEqual(ws.slots_taken(inflight), 3)
+        self.assertEqual(ws.slots_taken(inflight, {"102"}), 2)
+
+    def test_predict_loop_stops_when_queue_full(self):
+        """Когда реальная очередь заполнена — предсказатель не бежит вперёд."""
+        ws = WorkerState(index=1, name="К")
+        ws.running = True
+        ws.mode = "take"
+        ws.last_order_id = 6450000
+        ws.observed_anchor = 6450000
+        ws.last_csrf_token = "tok"
+        ws.demands_ids = {str(6449000 + i) for i in range(10)}  # цель=10, очередь полна
+        cfg = self._cfg(predictive_take_gap_ms=0, predictive_take_lookahead=0)
+        calls = []
+
+        async def run():
+            with mock.patch("app.http_worker._do_take", self._fake_do_take(calls)):
+                task = asyncio.create_task(
+                    predict_loop(None, cfg, cfg.accounts[0], ws, None, None, set(), set())
+                )
+                await asyncio.sleep(0.05)
+                ws.running = False
+                await asyncio.gather(task, return_exceptions=True)
+        asyncio.run(run())
+        self.assertEqual(calls, [])  # нет свободного слота — ничего не предсказываем
+
+    def test_predict_loop_reanchors_when_reality_overtakes(self):
+        """Если реальность обогнала курсор — догоняем её и предсказываем от неё."""
+        ws = WorkerState(index=1, name="К")
+        ws.running = True
+        ws.mode = "take"
+        ws.observed_anchor = 6450100  # реальность ушла вперёд
+        ws.last_order_id = 6450000    # курсор отстал
+        ws.last_csrf_token = "tok"
+        cfg = self._cfg(predictive_take_count=3, predictive_take_gap_ms=0,
+                        predictive_take_lookahead=0)
+        calls = []
+
+        def stop_after_first_window(_row):
+            if len(calls) >= 3:
+                ws.running = False
+            return False
+
+        async def run():
+            with mock.patch("app.http_worker._do_take",
+                            self._fake_do_take(calls, on_call=stop_after_first_window)):
+                await predict_loop(None, cfg, cfg.accounts[0], ws, None, None, set(), set())
+        asyncio.run(run())
+        self.assertEqual([c[0] for c in calls], ["6450101", "6450102", "6450103"])
+
+    def test_predicted_inflight_cleared_after_window(self):
+        """Спекулятивные отправки не «залипают»: после окна набор пуст."""
+        ws = WorkerState(index=1, name="К")
+        ws.last_order_id = 6442137
+        ws.last_csrf_token = "tok"
+        cfg = self._cfg(predictive_take_count=3)
+        calls = []
+
+        async def run():
+            with mock.patch("app.http_worker._do_take", self._fake_do_take(calls)):
+                tasks = _fire_predicted_window(
+                    None, cfg, cfg.accounts[0], ws, None, None, set(), set()
+                )
+                await asyncio.gather(*tasks)
+        asyncio.run(run())
+        self.assertEqual(ws.predicted_inflight, set())
+
+    def test_predict_loop_does_not_run_past_lookahead(self):
+        """Защита от «убегания вперёд»: пока реальность (observed_anchor) не
+        двигается, предсказатель не отправляет id дальше, чем на
+        predictive_take_lookahead от реально увиденной заявки.
+
+        count=3, lookahead=6 -> ровно 3 окна (9 отправок), после чего цикл
+        упирается в лимит и НЕ шлёт больше (в отличие от lookahead=0, где он
+        продолжил бы шагать без остановки).
+        """
+        ws = WorkerState(index=1, name="К")
+        ws.running = True
+        ws.mode = "take"
+        ws.last_order_id = 6450000
+        ws.observed_anchor = 6450000
+        ws.last_csrf_token = "tok"
+        cfg = self._cfg(predictive_take_count=3, predictive_take_gap_ms=10,
+                        predictive_take_lookahead=6)
+        calls = []
+
+        async def run():
+            with mock.patch("app.http_worker._do_take", self._fake_do_take(calls)):
+                task = asyncio.create_task(
+                    predict_loop(None, cfg, cfg.accounts[0], ws, None, None, set(), set())
+                )
+                await asyncio.sleep(0.2)  # время отработать окна и упереться в лимит
+                ws.running = False
+                await asyncio.gather(task, return_exceptions=True)
+        asyncio.run(run())
+
+        self.assertEqual(
+            [c[0] for c in calls],
+            ["6450001", "6450002", "6450003",
+             "6450004", "6450005", "6450006",
+             "6450007", "6450008", "6450009"],
+        )
+        # курсор не убежал дальше лимита lookahead
+        self.assertEqual(ws.last_order_id, 6450009)
+        self.assertEqual(ws.observed_anchor, 6450000)
+
+    def test_predict_loop_resumes_after_new_observation(self):
+        """Как только реальность догнала курсор (новая заявка сдвинула
+        observed_anchor), предсказатель снова продолжает шагать — мы остаёмся
+        в актуальном цикле, а не «залипаем» позади или впереди."""
+        ws = WorkerState(index=1, name="К")
+        ws.running = True
+        ws.mode = "take"
+        ws.last_order_id = 6450000
+        ws.observed_anchor = 6450000
+        ws.last_csrf_token = "tok"
+        cfg = self._cfg(predictive_take_count=3, predictive_take_gap_ms=10,
+                        predictive_take_lookahead=3)
+        calls = []
+
+        async def wait_for(cond, timeout=1.0):
+            waited = 0.0
+            while not cond() and waited < timeout:
+                await asyncio.sleep(0.01)
+                waited += 0.01
+
+        async def run():
+            with mock.patch("app.http_worker._do_take", self._fake_do_take(calls)):
+                task = asyncio.create_task(
+                    predict_loop(None, cfg, cfg.accounts[0], ws, None, None, set(), set())
+                )
+                # фаза 1: предсказатель отрабатывает до лимита lookahead (2 окна = 6)
+                await wait_for(lambda: len(calls) >= 6)
+                n_at_limit = len(calls)
+                # фаза 2: реальность статична — новых отправок быть не должно
+                await asyncio.sleep(0.05)
+                self.assertEqual(len(calls), n_at_limit)
+                # фаза 3: реальность догнала курсор — предсказатель возобновляет
+                ws.observed_anchor = ws.last_order_id
+                await wait_for(lambda: len(calls) > n_at_limit)
+                self.assertGreater(len(calls), n_at_limit)
+                ws.running = False
+                await asyncio.gather(task, return_exceptions=True)
+        asyncio.run(run())
 
 
 class LoadCookiesTest(unittest.TestCase):

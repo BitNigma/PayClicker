@@ -53,6 +53,8 @@
 | Cloudflare просит «Verify you are human» | `_click_turnstile()` — обход всех `page.frames` (домен Cloudflare / `blob:`), затем `iframe[id^='cf-chl-widget-']` + `#challenge-stage`; вызывается из `_wait_for_login_form`/`_wait_challenge_passed` |
 | «Форма входа не появилась» | `debug_login_form_missing_*.html`; селекторы `SEL_LOGIN_*`, таймаут `LOGIN_FORM_TIMEOUT_S` |
 | Заявки не берутся, хотя сессия жива | `./data/metrics.jsonl` (`saw_to_sent_ms`, `poll_rtt_ms`, `submit_rtt_ms`); `tools/metrics_report.py` |
+| Предиктив «слепнет» / убегает вперёд | `predict_loop` + `_poll_loop`: спекулятивные отправки в `ws.predicted_inflight` не считаются слотами; при полной очереди предсказатель ждёт; курсор догоняет `observed_anchor`; предел — `PREDICTIVE_TAKE_LOOKAHEAD` |
+| Взяли заявку или нет — что ответил сервер | `_classify_take_response()` по телу `POST take_payout` (`TAKE_REPLY_*`); дамп `./data/take_request_http_*.json` (`text_head` + `server_reply`); ground truth всё равно `_confirm_taken` по demands |
 | Счётчик очереди расходится | сверка `DEMANDS_URL`, `resync_demand*s`, `/reset_session` |
 | Мультиаккаунт читается не так | `python tools/check_accounts.py` (залипшие env!) |
 

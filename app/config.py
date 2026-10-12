@@ -78,6 +78,14 @@ class Config:
     # (взятые заявки, ошибки, блокировки, 2FA) — чтобы не спамить.
     debug: bool = True
 
+    # Разбор ТЕЛА ответа сайта на POST take_payout (диагностика/уведомления).
+    # Ground truth о взятии всё равно берётся со страницы demands; эти маркеры лишь
+    # помогают ПОНЯТЬ и озвучить, что ответил сервер. Пусто по умолчанию — тогда
+    # работает только структурная проверка (форма взятия ещё на странице?).
+    # Формулировки площадки могут меняться — задаются через env (см. .env.example).
+    take_success_markers: tuple = ()
+    take_gone_markers: tuple = ()
+
     @property
     def allowed_chat_id(self) -> int:
         """Первый (основной) админ — для обратной совместимости и логов."""
@@ -146,6 +154,24 @@ def _req(env, name: str) -> str:
     if not val:
         raise RuntimeError(f"Missing required env var: {name}")
     return val
+
+
+def _split_markers(raw: str) -> tuple:
+    """Разбирает строку маркеров из env в кортеж непустых значений (нижний регистр).
+
+    Разделитель — запятая. Внутренние пробелы схлопываются в один, чтобы маркер
+    совпадал с текстом страницы независимо от лишних пробелов/переносов. Регистр
+    не важен — сравнение идёт по нижнему регистру (см. http_worker._classify_take_response).
+    """
+    if not raw:
+        return ()
+    markers = []
+    for part in raw.split(","):
+        cleaned = re.sub(r"\s+", " ", part).strip().lower()
+        if cleaned:
+            markers.append(cleaned)
+    return tuple(markers)
+
 
 
 def load_accounts(env) -> list[Account]:
@@ -230,5 +256,8 @@ def load_config() -> Config:
         predictive_take_lookahead=int(env.get("PREDICTIVE_TAKE_LOOKAHEAD", "200")),
         # Отладочные сообщения в Telegram (дампы, подробные сводки). DEBUG=false — тише.
         debug=env.get("DEBUG", "true").lower() == "true",
+        # Маркеры в теле ответа на POST take_payout (каждое значение — через запятую).
+        take_success_markers=_split_markers(env.get("TAKE_SUCCESS_MARKERS", "")),
+        take_gone_markers=_split_markers(env.get("TAKE_GONE_MARKERS", "")),
     )
 

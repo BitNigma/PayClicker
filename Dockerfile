@@ -33,4 +33,4 @@ RUN mkdir -p /data
 VOLUME ["/data"]
 
 # Запускаем через xvfb-run, чтобы headless=False работал в контейнере без дисплея
-CMD ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1920x1080x24", "python", "-m", "app.main"]
+CMD ["bash", "-c", "rm -f /tmp/.X99-lock; Xvfb :99 -screen 0 1920x1080x24 -ac & sleep 1; export DISPLAY=:99; x11vnc -display :99 -forever -shared -passwd \"$VNC_PASSWORD\" -quiet -bg; exec python -m app.main"]

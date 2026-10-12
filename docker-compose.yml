@@ -27,6 +27,8 @@ services:
       - ${DATA_DIR:-./data}:/data
     # shm нужен браузеру, дефолтных 64MB часто не хватает -> краши Chromium
     shm_size: "1gb"
+    ports:
+      - "127.0.0.1:5900:5900"
     # Ограничение логов Docker, иначе за месяцы работы они забьют диск VPS
     logging:
       driver: json-file

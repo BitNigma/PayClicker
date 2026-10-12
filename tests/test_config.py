@@ -3,7 +3,13 @@ import os
 import unittest
 from unittest.mock import patch
 
-from app.config import _ADMIN_ID_ENV_VARS, load_accounts, load_config, parse_chat_ids
+from app.config import (
+    _ADMIN_ID_ENV_VARS,
+    _split_markers,
+    load_accounts,
+    load_config,
+    parse_chat_ids,
+)
 
 
 class ParseChatIdsTest(unittest.TestCase):
@@ -183,6 +189,35 @@ class DebugConfigTest(unittest.TestCase):
     def test_override_false(self):
         with patch.dict(os.environ, dict(self.BASE_ENV, DEBUG="false"), clear=True):
             self.assertFalse(load_config().debug)
+
+
+class TakeMarkersConfigTest(unittest.TestCase):
+    """TAKE_SUCCESS_MARKERS / TAKE_GONE_MARKERS: разбор тела ответа на взятие."""
+
+    BASE_ENV = DemandsSyncConfigTest.BASE_ENV
+
+    def test_split_markers_trims_and_lowercases(self):
+        self.assertEqual(_split_markers(" Заявка  не найдена ,, Уже взята "),
+                         ("заявка не найдена", "уже взята"))
+        self.assertEqual(_split_markers(""), ())
+        self.assertEqual(_split_markers("   "), ())
+
+    def test_empty_by_default(self):
+        with patch.dict(os.environ, self.BASE_ENV, clear=True):
+            cfg = load_config()
+            self.assertEqual(cfg.take_success_markers, ())
+            self.assertEqual(cfg.take_gone_markers, ())
+
+    def test_loaded_from_env(self):
+        env = dict(
+            self.BASE_ENV,
+            TAKE_SUCCESS_MARKERS="успешно взята",
+            TAKE_GONE_MARKERS="заявка не найдена, уже взята",
+        )
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+            self.assertEqual(cfg.take_success_markers, ("успешно взята",))
+            self.assertEqual(cfg.take_gone_markers, ("заявка не найдена", "уже взята"))
 
 
 if __name__ == "__main__":

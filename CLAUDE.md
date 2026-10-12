@@ -69,10 +69,32 @@ ID заявок на площадке идут по порядку, поэтом
 по `inflight` / `demands_ids` / `taken_order_ids` / `ws.predictive_sent`. Окно НЕ
 ограничивается свободными слотами: площадка сама не даст держать в работе больше своего
 лимита (≈10), а несуществующие id просто не подтвердятся. Пауза между окнами —
-`PREDICTIVE_TAKE_GAP_MS`; предохранитель от бесконечного забегания —
-`PREDICTIVE_TAKE_LOOKAHEAD` (дальше него от `observed_anchor` не идём, ждём новую
-заявку). Такие взятия идут с `predicted=True`: без дампов и без уведомлений о неудаче.
-По умолчанию выключено (`PREDICTIVE_TAKE=false`) — это доп. POST-нагрузка.
+`PREDICTIVE_TAKE_GAP_MS`. Такие взятия идут с `predicted=True`: без дампов и без
+уведомлений о неудаче. По умолчанию выключено (`PREDICTIVE_TAKE=false`) — это доп. POST-нагрузка.
+
+**Защита от «убегания вперёд»** (чтобы всегда оставаться в актуальном цикле):
+- спекулятивные (предсказанные) отправки идут в `ws.predicted_inflight` и **не считаются
+  занятыми слотами** (`slots_taken(..., speculative=...)`) — поэтому `_poll_loop` продолжает
+  опрашивать реальную очередь и не «слепнет» во время пачки предсказаний;
+- `predict_loop` **не предсказывает, когда реальная очередь полна** (нет свободного слота);
+- если реальность обогнала курсор (`observed_anchor > last_order_id`) — курсор **догоняет**
+  её (re-anchor), чтобы не долбить неактуальные id;
+- верхняя граница забегания — `PREDICTIVE_TAKE_LOOKAHEAD` id от `observed_anchor`
+  (0 = без ограничения; меньше значение = безопаснее).
+
+### Разбор ответа сервера на взятие (`_classify_take_response`)
+
+Ответ на `POST take_payout` сохраняется в дамп (`_dump_take_request` → `response.text_head`
++ `server_reply`) и разбирается, чтобы ОЗВУЧИТЬ результат в Telegram:
+- `TAKE_REPLY_TAKEN` — сервер подтвердил взятие (маркер из `TAKE_SUCCESS_MARKERS`
+  или строка заявки в ответе имеет статус «в работе у провайдера»);
+- `TAKE_REPLY_GONE` — заявки нет / её забрали раньше (`TAKE_GONE_MARKERS`);
+- `TAKE_REPLY_STILL_AVAILABLE` — форма «Забрать выплату» по этому id всё ещё в ответе;
+- `TAKE_REPLY_UNKNOWN` — по телу понять нельзя.
+
+⚠️ Это **диагностика**, а не решение: наша ли заявка — по-прежнему определяет сверка со
+страницей demands (`_confirm_taken`). Маркеры задаются в env только если формулировки
+площадки известны (`TAKE_SUCCESS_MARKERS` / `TAKE_GONE_MARKERS`, по умолчанию пусто).
 
 ## Источник правды о размере очереди
 
@@ -122,7 +144,7 @@ ID заявок на площадке идут по порядку, поэтом
 (`http`|`browser`), `HTTP_TIMEOUT_S`, `DEBUG_CAPTURE_ATTEMPTS`, `HEADLESS`,
 `BLOCK_REAUTH_ATTEMPTS`, `PREDICTIVE_TAKE`, `PREDICTIVE_TAKE_COUNT`,
 `PREDICTIVE_TAKE_GAP_MS`, `PREDICTIVE_TAKE_LOOKAHEAD`, `DEBUG`,
-`STORAGE_STATE_PATH`, `LOG_PATH`, `METRICS_PATH`.
+`TAKE_SUCCESS_MARKERS`, `TAKE_GONE_MARKERS`, `STORAGE_STATE_PATH`, `LOG_PATH`, `METRICS_PATH`.
 Полный список и комментарии — `.env.example`.
 
 > `load_dotenv()` **не перезаписывает** уже заданные env-переменные. Залипшие
