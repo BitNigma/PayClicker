@@ -11,9 +11,12 @@ ENV PYTHONUNBUFFERED=1 \
 # Xvfb нужен, чтобы запускать браузер в headful-режиме (headless=False)
 # внутри контейнера без физического дисплея — это снижает вероятность
 # детекта автоматизации некоторыми антибот-системами.
+# x11vnc — чтобы подключаться к виртуальному экрану по VNC (через SSH-туннель)
+# и вручную проходить проверку «я не робот» при авторизации.
 # tzdata — чтобы работал TZ из .env (иначе время в логах всегда UTC).
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     xvfb \
+    x11vnc \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 
@@ -32,5 +35,4 @@ COPY tests ./tests
 RUN mkdir -p /data
 VOLUME ["/data"]
 
-# Запускаем через xvfb-run, чтобы headless=False работал в контейнере без дисплея
-CMD ["bash", "-c", "rm -f /tmp/.X99-lock; Xvfb :99 -screen 0 1920x1080x24 -ac & sleep 1; export DISPLAY=:99; x11vnc -display :99 -forever -shared -passwd \"$VNC_PASSWORD\" -quiet -bg; exec python -m app.main"]
+CMD ["bash", "-c", "rm -f /tmp/.X99-lock; Xvfb :99 -screen 0 1920x1080x24 -ac & sleep 1; export DISPLAY=:99; if [ -n \"$VNC_PASSWORD\" ]; then x11vnc -display :99 -forever -shared -passwd \"$VNC_PASSWORD\" -quiet -bg; fi; exec python -m app.main"]
