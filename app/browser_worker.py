@@ -381,6 +381,12 @@ async def _send_debug_dump(page: Page, cfg: Config, notify, notify_file, name: s
     except Exception:
         logger.exception("html в debug-дампе не удался")
         html = ""
+    # Файлы сохраняем в ./data всегда (пригодятся для разбора), а в Telegram шлём
+    # только при DEBUG=true — иначе бот молча пишет их на диск и не спамит.
+    if not cfg.debug:
+        logger.info("debug-дамп сохранён локально (DEBUG=false): %s, %s", html_path, png_path)
+        return html
+
     await notify(f"{caption}\nURL: {page_url}\nФайлы: {html_path.name}, {png_path.name}")
     if notify_file is not None:
         try:
@@ -798,10 +804,11 @@ async def _sync_demands_on_start(status_page: Page, cfg: Config, notify) -> None
     state.demands_ids = in_work
     ids_str = f" ({', '.join(f'#{i}' for i in sorted(in_work))})" if in_work else ""
     free = max(0, cfg.target_queue_size - len(in_work))
-    await notify(
-        f"📊 Сверка с площадкой: в работе уже {len(in_work)}/{cfg.target_queue_size} заявок"
-        f"{ids_str}. Возьму ещё {free}."
-    )
+    if cfg.debug:
+        await notify(
+            f"📊 Сверка с площадкой: в работе уже {len(in_work)}/{cfg.target_queue_size} заявок"
+            f"{ids_str}. Возьму ещё {free}."
+        )
 
 
 async def _confirm_taken(page: Page, cfg: Config, order_id: str, attempts: int = 6, delay: float = 0.5) -> bool:
@@ -907,7 +914,8 @@ async def _confirm_and_report(confirm_page: Page, confirm_lock: asyncio.Lock, cf
         # Заявка сразу занимает слот: не ждём следующей сверки с demands.
         state.demands_ids.add(order_id)
         await notify(f"✅ Взята заявка #{order_id}")
-        await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg)}")
+        if cfg.debug:
+            await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg)}")
     else:
         await notify(f"⚠️ Заявку #{order_id} не удалось подтвердить — похоже, её забрали раньше нас.")
 
@@ -1137,7 +1145,8 @@ async def status_loop(status_page: Page, cfg: Config, notify):
                     state.taken_order_ids.discard(oid)
                     status = seen_status.get(oid) or "завершена"
                     await notify(f"ℹ️ Заявка #{oid}: статус «{status}» — убираю из очереди, слот свободен.")
-                    await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg)}")
+                    if cfg.debug:
+                        await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg)}")
 
             # Заявки, которых мы не брали (автовыдача площадки) — тоже занимают слот.
             auto = sorted(in_work - prev - state.taken_order_ids)
@@ -1146,7 +1155,8 @@ async def status_loop(status_page: Page, cfg: Config, notify):
                 await notify(
                     f"📦 Автовыдача: {auto_str} уже в работе (площадка выдала без нашего взятия)."
                 )
-                await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg)}")
+                if cfg.debug:
+                    await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg)}")
 
         for _ in range(max(1, cfg.demands_sync_s)):
             if not (state.running and state.mode == "take"):

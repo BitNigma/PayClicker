@@ -35,6 +35,29 @@ class WorkerState:
     # (иначе на пустом кэше он наберёт лишнее сверх TARGET_QUEUE_SIZE).
     resync_required: bool = False
 
+    # Горячий цикл/проверка сессии наткнулись на блокировку (403/антибот,
+    # Cloudflare). run_worker по этому флагу сбрасывает cookies кабинета и
+    # проходит браузерную авторизацию заново.
+    needs_reauth: bool = False
+    # Сколько раз подряд уже переавторизовывались после блокировки (ограничение,
+    # чтобы не зациклиться на устойчивой блокировке).
+    reauth_attempts: int = 0
+
+    # Превентивное взятие: курсор, от которого предсказываем будущие id. Изначально
+    # ставится в максимальный id, увиденный в очереди, и далее сдвигается вперёд
+    # окнами по PREDICTIVE_TAKE_COUNT (см. http_worker.predict_loop).
+    last_order_id: int = 0
+    # Максимальный id, который мы реально ВИДЕЛИ в HTML очереди (не предсказанный).
+    # Нужен как «точка опоры»: далеко от неё вперёд не забегаем (см. lookahead).
+    observed_anchor: int = 0
+    # Последний известный csrf_token страницы (он общий для всех строк) — нужен,
+    # чтобы отправлять take_payout на предсказанные id без чтения HTML.
+    last_csrf_token: str | None = None
+    # id, для которых предсказательное взятие уже отправлялось (дедупликация).
+    predictive_sent: set = field(default_factory=set)
+    # Сколько окон подряд не дали ни одной заявки (для анти-шума / диагностики).
+    predictive_rounds: int = 0
+
     # Канал, через который телеграм-бот прокидывает введённый 2FA-код в воркер
     two_fa_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
 
@@ -115,6 +138,8 @@ class BotState:
         "demands_ids",
         "snapshot_requested",
         "resync_required",
+        "needs_reauth",
+        "reauth_attempts",
         "two_fa_queue",
     )
 

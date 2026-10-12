@@ -57,6 +57,23 @@ python tools/metrics_report.py    # отчёт по ./data/metrics.jsonl
 4. `take_loop`: `TAKE_PARALLEL_POLLERS` воронок делают `GET QUEUE_URL`, парсят HTML регулярками (`parse_rows`), и одним «такт»-ом делают `POST` формы `take_payout`, не блокируя цикл.
 5. `demands_loop`/`resync_demands_loop` раз в `DEMANDS_SYNC_S` сверяются со страницей `DEMANDS_URL` — это **источник правды о занятых слотах** (автовыдача, заявки с прошлого запуска).
 
+### Превентивное взятие будущих id (`PREDICTIVE_TAKE`)
+
+ID заявок на площадке идут по порядку, поэтому отдельный фон `predict_loop` шагает
+вперёд **окнами** по `PREDICTIVE_TAKE_COUNT` (по умолчанию **25**): от курсора
+`ws.last_order_id` шлёт `take_payout` на `cursor+1 … cursor+N`, **не дожидаясь их
+появления в HTML**. Если окно целиком неудачное — курсор сдвигается на наибольший id
+окна и шлётся следующее окно (поиск вперёд), и так далее, пока не поймает заявку.
+`_observe_queue` (в `_poll_loop`) обновляет общий для страницы `csrf_token`
+(`ws.last_csrf_token`) и якорь `ws.observed_anchor` (макс. реально увиденный id); дедуп —
+по `inflight` / `demands_ids` / `taken_order_ids` / `ws.predictive_sent`. Окно НЕ
+ограничивается свободными слотами: площадка сама не даст держать в работе больше своего
+лимита (≈10), а несуществующие id просто не подтвердятся. Пауза между окнами —
+`PREDICTIVE_TAKE_GAP_MS`; предохранитель от бесконечного забегания —
+`PREDICTIVE_TAKE_LOOKAHEAD` (дальше него от `observed_anchor` не идём, ждём новую
+заявку). Такие взятия идут с `predicted=True`: без дампов и без уведомлений о неудаче.
+По умолчанию выключено (`PREDICTIVE_TAKE=false`) — это доп. POST-нагрузка.
+
 ## Источник правды о размере очереди
 
 `TARGET_QUEUE_SIZE` считается НЕ по памяти бота, а по странице `DEMANDS_URL`:
@@ -77,6 +94,11 @@ python tools/metrics_report.py    # отчёт по ./data/metrics.jsonl
   `#challenge-stage` для challenge без iframe. Клик — best-effort (force-клик при
   перекрытии), один раз за проход. Вызывается из `_wait_for_login_form` и
   `_wait_challenge_passed` на каждой итерации ожидания.
+- При блокировке HTTP-цикла (403/антибот, Cloudflare) воркер **сам сбрасывает
+  cookies кабинета и авторизуется заново**: циклы ставят `ws.needs_reauth`, а
+  `run_worker` вызывает `_recover_from_block` (удаляет `auth.json` через
+  `_reset_stored_session`, затем `ensure_session(force_reauth=True)`). Число подряд
+  переавторизаций ограничено `MAX_BLOCK_REAUTH` (env `BLOCK_REAUTH_ATTEMPTS`, по умолчанию 3).
 - 🚨 **ГРАБЛИ (уже исправлялась)**: после успешного входа сайт часто уводит на дашборд
   `/account/` («личный кабинет», класс `user-account-page`), где нет таблицы выплат.
   `_looks_like_cabinet()` обязан считать такой дашборд кабинетом, иначе успешный вход
@@ -98,6 +120,8 @@ python tools/metrics_report.py    # отчёт по ./data/metrics.jsonl
 `DEMANDS_URL`, `TARGET_QUEUE_SIZE`, `RELOAD_MIN_MS/MAX_MS`, `TAKE_POLL_MIN_MS/MAX_MS`,
 `TAKE_PARALLEL_POLLERS`, `DEMANDS_SYNC_S`, `LOGIN_FORM_TIMEOUT_S`, `WORKER_BACKEND`
 (`http`|`browser`), `HTTP_TIMEOUT_S`, `DEBUG_CAPTURE_ATTEMPTS`, `HEADLESS`,
+`BLOCK_REAUTH_ATTEMPTS`, `PREDICTIVE_TAKE`, `PREDICTIVE_TAKE_COUNT`,
+`PREDICTIVE_TAKE_GAP_MS`, `PREDICTIVE_TAKE_LOOKAHEAD`, `DEBUG`,
 `STORAGE_STATE_PATH`, `LOG_PATH`, `METRICS_PATH`.
 Полный список и комментарии — `.env.example`.
 

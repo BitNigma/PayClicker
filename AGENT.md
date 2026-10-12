@@ -49,6 +49,7 @@
 |---|---|
 | Вход «прошёл», но цикл не стартует | `./data/debug_after_login_unexpected_*.html` → если это дашборд `/account/` (`user-account-page`), значит `_looks_like_cabinet()` не распознал входную страницу |
 | Капча/антибот | маркеры в `UNEXPECTED_PAGE_MARKERS`, `_is_challenge_page`; дампы `debug_*captcha/challenge*` |
+| HTTP 403 / «Just a moment…» в горячем цикле | `_classify()` (`_BLOCKED_MARKERS`) + `PayoutClient._check()` → `BlockedError`; воркер сам сбрасывает cookies (`_reset_stored_session`) и переавторизуется (`_recover_from_block`), лимит `BLOCK_REAUTH_ATTEMPTS` (по умолч. 3) |
 | Cloudflare просит «Verify you are human» | `_click_turnstile()` — обход всех `page.frames` (домен Cloudflare / `blob:`), затем `iframe[id^='cf-chl-widget-']` + `#challenge-stage`; вызывается из `_wait_for_login_form`/`_wait_challenge_passed` |
 | «Форма входа не появилась» | `debug_login_form_missing_*.html`; селекторы `SEL_LOGIN_*`, таймаут `LOGIN_FORM_TIMEOUT_S` |
 | Заявки не берутся, хотя сессия жива | `./data/metrics.jsonl` (`saw_to_sent_ms`, `poll_rtt_ms`, `submit_rtt_ms`); `tools/metrics_report.py` |

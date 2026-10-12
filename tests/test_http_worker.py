@@ -9,22 +9,32 @@ import tempfile
 import threading
 import unittest
 from dataclasses import replace
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import httpx
 
 from app.config import Account, Config
 from app.http_worker import (
     STATUS_IN_WORK_MARKER,
     SITE_HOST,
+    MAX_BLOCK_REAUTH,
+    BlockedError,
     Metrics,
     PayoutClient,
     _classify,
+    _fire_predicted_window,
+    _observe_queue,
+    _recover_from_block,
+    _reset_stored_session,
     in_work_ids,
     load_cookies,
     parse_rows,
+    predict_loop,
     take_loop,
 )
-from app.state import state
+from app.state import WorkerState, state
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
@@ -139,6 +149,213 @@ class ClassifyTest(unittest.TestCase):
 
     def test_blocked(self):
         self.assertEqual(_classify('script src="https://geo.captcha-delivery.com/c.js"', "https://x/"), "blocked")
+
+    def test_blocked_cloudflare_challenge(self):
+        # Cloudflare отдаёт страницу-заглушку «Just a moment…» → это блок, а не ok.
+        html = "<title>Just a moment...</title><div id='cf-chl-widget'></div>"
+        self.assertEqual(_classify(html, "https://spark-trading.cash/account/payouts/"), "blocked")
+
+    def test_normal_payouts_page_is_ok(self):
+        html = "<table class='payout-table'><tr><td class='payout-status'># 1</td></tr></table>"
+        self.assertEqual(_classify(html, "https://spark-trading.cash/account/payouts/"), "ok")
+
+
+class BlockedResponseTest(unittest.TestCase):
+    """_check должен распознавать 403/антибот, а не молча считать страницу валидной."""
+
+    def _check(self, response):
+        PayoutClient(make_config(), {})._check(response)
+
+    def _resp(self, status, text):
+        return httpx.Response(
+            status,
+            request=httpx.Request("GET", "https://spark-trading.cash/account/payouts/"),
+            text=text,
+        )
+
+    def test_http_403_is_blocked(self):
+        with self.assertRaises(BlockedError):
+            self._check(self._resp(403, "<html>blocked</html>"))
+
+    def test_cloudflare_challenge_body_is_blocked(self):
+        with self.assertRaises(BlockedError):
+            self._check(self._resp(200, "<title>Just a moment...</title>"))
+
+    def test_normal_page_passes(self):
+        # Не должно бросать исключение.
+        self._check(self._resp(200, "<table class='payout-table'></table>"))
+
+
+class ResetStoredSessionTest(unittest.TestCase):
+    """Сброс сохранённых cookies кабинета (файла auth.json)."""
+
+    def test_removes_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "auth.json"
+            p.write_text("{}", encoding="utf-8")
+            account = make_config(storage_state_path=str(p)).accounts[0]
+            self.assertTrue(_reset_stored_session(account))
+            self.assertFalse(p.exists())
+
+    def test_missing_file_returns_false(self):
+        account = make_config(storage_state_path="/nonexistent/auth.json").accounts[0]
+        self.assertFalse(_reset_stored_session(account))
+
+
+class RecoverFromBlockTest(unittest.TestCase):
+    """Авто-переавторизация после блокировки 403/антибот."""
+
+    def test_resets_session_and_reauths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "auth.json"
+            p.write_text("{}", encoding="utf-8")
+            account = make_config(storage_state_path=str(p)).accounts[0]
+            ws = WorkerState(index=1, name="Кабинет 1")
+            sent = []
+
+            async def notify(text):
+                sent.append(text)
+
+            async def fake_ensure(cfg, account, ws, notify, notify_file=None, force_reauth=False):
+                self.assertTrue(force_reauth)  # переавторизация идёт с нуля
+                return {"PHPSESSID": "x"}
+
+            with mock.patch("app.http_worker.ensure_session", fake_ensure):
+                ok = asyncio.run(_recover_from_block(make_config(), account, ws, notify, notify))
+            self.assertTrue(ok)
+            self.assertEqual(ws.reauth_attempts, 1)
+            self.assertFalse(p.exists())  # cookies сброшены
+            self.assertTrue(any("Сбрасываю сохранённые cookies" in m for m in sent))
+
+    def test_stops_after_max_attempts(self):
+        account = make_config().accounts[0]
+        ws = WorkerState(index=1, name="К")
+        ws.reauth_attempts = MAX_BLOCK_REAUTH
+        sent = []
+
+        async def notify(text):
+            sent.append(text)
+
+        ok = asyncio.run(_recover_from_block(make_config(), account, ws, notify, notify))
+        self.assertFalse(ok)
+        self.assertTrue(any("не помогла" in m for m in sent))
+
+
+class PredictiveTakeTest(unittest.TestCase):
+    """Превентивное взятие: шагаем вперёд окнами по count id от пойманного id."""
+
+    def _cfg(self, **kw):
+        kw.setdefault("predictive_take", True)
+        kw.setdefault("predictive_take_count", 3)
+        return make_config(**kw)
+
+    @staticmethod
+    def _fake_do_take(calls, on_call=None):
+        async def fake(client, cfg, account, ws, notify, metrics, row, timing,
+                       t_recv, inflight, predicted=False):
+            calls.append((row["id"], predicted))
+            if on_call is not None:
+                return on_call(row)
+            return True
+        return fake
+
+    def test_observe_queue_sets_anchor_and_cursor(self):
+        ws = WorkerState(index=1, name="К")
+        rows = [
+            {"id": "6442130", "csrf_token": "tok", "access_key": ""},
+            {"id": "6442137", "csrf_token": "tok", "access_key": ""},
+        ]
+        _observe_queue(ws, rows)
+        self.assertEqual(ws.observed_anchor, 6442137)
+        self.assertEqual(ws.last_order_id, 6442137)
+        self.assertEqual(ws.last_csrf_token, "tok")
+
+    def test_fire_window_advances_cursor(self):
+        ws = WorkerState(index=1, name="К")
+        ws.last_order_id = 6442137
+        ws.last_csrf_token = "tok"
+        cfg = self._cfg()
+        account = cfg.accounts[0]
+        calls = []
+
+        async def run():
+            with mock.patch("app.http_worker._do_take", self._fake_do_take(calls)):
+                tasks = _fire_predicted_window(
+                    None, cfg, account, ws, None, None, set(), set()
+                )
+                await asyncio.gather(*tasks)
+        asyncio.run(run())
+        self.assertEqual([c[0] for c in calls], ["6442138", "6442139", "6442140"])
+        self.assertTrue(all(c[1] for c in calls))  # все — предсказанные
+        self.assertEqual(ws.last_order_id, 6442140)  # курсор = наибольший id окна
+
+    def test_fire_window_skips_known_ids(self):
+        ws = WorkerState(index=1, name="К")
+        ws.last_order_id = 6442137
+        ws.last_csrf_token = "tok"
+        ws.demands_ids = {"6442138"}
+        cfg = self._cfg()
+        account = cfg.accounts[0]
+        calls = []
+
+        async def run():
+            with mock.patch("app.http_worker._do_take", self._fake_do_take(calls)):
+                tasks = _fire_predicted_window(
+                    None, cfg, account, ws, None, None, set(), set()
+                )
+                await asyncio.gather(*tasks)
+        asyncio.run(run())
+        self.assertEqual([c[0] for c in calls], ["6442139", "6442140"])
+
+    def test_failed_window_advances_and_fires_next(self):
+        """Если окно целиком неудачное — берём наибольший id окна и шлём следующее."""
+        ws = WorkerState(index=1, name="К")
+        ws.running = True
+        ws.mode = "take"
+        ws.last_order_id = 6442137
+        ws.observed_anchor = 6442137
+        ws.last_csrf_token = "tok"
+        cfg = self._cfg(predictive_take_gap_ms=0, predictive_take_lookahead=0)
+        account = cfg.accounts[0]
+        calls = []
+
+        def stop_after_two_windows(_row):
+            if len(calls) >= 6:  # два окна по 3 — останавливаем фон
+                ws.running = False
+            return False  # все запросы неудачные
+
+        async def run():
+            with mock.patch("app.http_worker._do_take",
+                            self._fake_do_take(calls, on_call=stop_after_two_windows)):
+                await predict_loop(None, cfg, account, ws, None, None, set(), set())
+        asyncio.run(run())
+        self.assertEqual(
+            [c[0] for c in calls],
+            ["6442138", "6442139", "6442140", "6442141", "6442142", "6442143"],
+        )
+
+    def test_successful_window_resets_rounds(self):
+        ws = WorkerState(index=1, name="К")
+        ws.running = True
+        ws.mode = "take"
+        ws.last_order_id = 6442137
+        ws.observed_anchor = 6442137
+        ws.last_csrf_token = "tok"
+        ws.predictive_rounds = 3
+        cfg = self._cfg(predictive_take_gap_ms=0, predictive_take_lookahead=0)
+        account = cfg.accounts[0]
+        calls = []
+
+        def stop_after_first(_row):
+            ws.running = False
+            return True  # заявку поймали
+
+        async def run():
+            with mock.patch("app.http_worker._do_take",
+                            self._fake_do_take(calls, on_call=stop_after_first)):
+                await predict_loop(None, cfg, account, ws, None, None, set(), set())
+        asyncio.run(run())
+        self.assertEqual(ws.predictive_rounds, 0)  # успех сбрасывает счётчик
 
 
 class LoadCookiesTest(unittest.TestCase):

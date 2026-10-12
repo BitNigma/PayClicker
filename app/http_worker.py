@@ -52,7 +52,13 @@ class SessionExpired(Exception):
 
 
 class BlockedError(Exception):
-    """Антибот (DataDome) отдал challenge вместо страницы, вместо обычного HTML."""
+    """Антибот (DataDome/Cloudflare) отдал challenge/403 вместо обычного HTML."""
+
+
+# Сколько раз подряд разрешено сбросить cookies и авторизоваться заново после
+# блокировки (403/антибот). Ограничение, чтобы не зациклиться на устойчивом
+# блоке: если помогает — счётчик сбрасывается при первой же рабочей сессии.
+MAX_BLOCK_REAUTH = max(1, int(os.environ.get("BLOCK_REAUTH_ATTEMPTS", "3")))
 
 
 # ------------------------- разбор HTML (регулярки) -------------------------
@@ -156,10 +162,45 @@ def load_cookies(account) -> dict:
     return cookies
 
 
+# Заглушки антибота/блокировки: DataDome-подобные защиты и Cloudflare, когда он
+# отдаёт challenge/403 «Just a moment…» вместо страницы. Без этих маркеров
+# такая заглушка выглядела бы как обычная страница ("ok"), и горячий цикл молча
+# крутился бы вхолостую (при этом сам ответ сайта — 403 Forbidden).
+_BLOCKED_MARKERS = (
+    "captcha-delivery.com",
+    "datadome",
+    "geo.captcha",
+    "cf_chl_opt",
+    "challenge-platform",
+    "challenges.cloudflare.com",
+    "just a moment",
+    "verify you are human",
+    "enable javascript and cookies",
+)
+
+
+def _reset_stored_session(account) -> bool:
+    """Сбрасывает сохранённые cookies кабинета (удаляет auth.json).
+
+    Нужно, когда сайт блокирует уже сохранённую сессию (403/Cloudflare): старый
+    cf_clearance мог «сгореть», и авторизацию надо пройти с нуля. Возвращает True,
+    если файл сессии реально был и удалён.
+    """
+    path = Path(account.storage_state_path)
+    try:
+        if path.exists():
+            path.unlink()
+            logger.info("Сброшена сохранённая сессия кабинета: %s", path)
+            return True
+    except Exception:
+        logger.exception("Не удалось сбросить сохранённую сессию %s", path)
+    return False
+
+
 def _classify(html: str, url: str) -> str:
     """ok | signin | blocked — по содержимому ответа и итоговому URL."""
     low = html.lower()
-    if "captcha-delivery.com" in low or "datadome" in low or "geo.captcha" in low:
+    if any(m in low for m in _BLOCKED_MARKERS):
         return "blocked"
     if "/signin" in url or "auth-form" in low:
         return "signin"
@@ -229,11 +270,14 @@ class PayoutClient:
 
     def _check(self, response: httpx.Response) -> None:
         kind = _classify(response.text, str(response.url))
-        if kind == "blocked":
+        # 403/429 — сайт (Cloudflare/антибот) заблокировал HTTP-клиент: даже если
+        # тело не похоже на challenge, продолжать опрос бессмысленно.
+        if kind == "blocked" or response.status_code in (403, 429):
             raise BlockedError(
-                "Сайт отдал антибот-заглушку (DataDome) вместо страницы: HTTP-клиент "
-                "распознан. Нужно обновить cookies через браузерную авторизацию "
-                "(или вернуться на WORKER_BACKEND=browser)."
+                f"Сайт отдал антибот-заглушку/HTTP {response.status_code} вместо "
+                "страницы: HTTP-клиент распознан (DataDome/Cloudflare). Нужно "
+                "обновить cookies через браузерную авторизацию (или вернуться на "
+                "WORKER_BACKEND=browser)."
             )
         if kind == "signin":
             raise SessionExpired("Сессия недействительна — сайт редиректит на /signin.")
@@ -295,12 +339,19 @@ async def _session_ok(client: PayoutClient) -> bool:
         return False
 
 
-async def ensure_session(cfg: Config, account, ws: WorkerState, notify, notify_file=None) -> dict | None:
+async def ensure_session(
+    cfg: Config, account, ws: WorkerState, notify, notify_file=None, force_reauth: bool = False
+) -> dict | None:
     """Возвращает рабочие cookies кабинета. Если сохранённые не годятся — разово
     поднимает браузер, чтобы обновить auth.json кабинета (вне горячего цикла).
     notify_file пробрасывается в браузерную авторизацию, чтобы HTML-дампы
-    проблемных страниц уходили прямо в Telegram."""
-    cookies = load_cookies(account)
+    проблемных страниц уходили прямо в Telegram.
+
+    force_reauth=True — не проверять и не использовать сохранённые cookies, а
+    сразу пройти авторизацию с нуля (используется при блокировке 403/антибот,
+    когда старый cf_clearance «сгорел»).
+    """
+    cookies = {} if force_reauth else load_cookies(account)
     if cookies:
         probe = PayoutClient(cfg, cookies)
         try:
@@ -309,7 +360,7 @@ async def ensure_session(cfg: Config, account, ws: WorkerState, notify, notify_f
         finally:
             await probe.aclose()
 
-    await notify("🔐 Cookies недействительны — разовая браузерная авторизация (вне горячего цикла)...")
+    await notify("🔐 Cookies недействительны/сброшены — разовая браузерная авторизация (вне горячего цикла)...")
     from .browser_worker import login_via_browser  # локальный импорт: браузер нужен только тут
 
     ok = await login_via_browser(cfg, account, ws, notify, notify_file)
@@ -383,12 +434,19 @@ async def _do_take(
     timing: dict,
     t_recv: float,
     inflight: set,
-) -> None:
+    predicted: bool = False,
+) -> bool:
     """Один такт по заявке: POST -> метрика -> подтверждение -> результат.
+
+    Возвращает True, если заявку удалось подтвердить (она наша).
 
     Запускается отдельной задачей, чтобы НЕ блокировать следующий GET очереди:
     сетевой RTT отправки POST перекрывается следующим опросом (это убирает
     ~150-270 мс «слепоты» на каждое взятие).
+
+    predicted=True — это превентивное взятие «будущего» id (его ещё не было в HTML).
+    Для таких заявок не пишем дампы и не шумим «не подтвердилось»: неудача —
+    нормальный исход, если заявки с таким id пока просто нет.
     """
     order_id = row["id"]
     csrf_token = row.get("csrf_token")
@@ -399,7 +457,7 @@ async def _do_take(
             response = await client.take_payout(order_id, csrf_token, access_key)
         except Exception as exc:
             logger.warning("[%s] POST take_payout для #%s не удался: %s", account.name, order_id, exc)
-            return
+            return False
         t_post_done = time.perf_counter()
 
         saw_to_sent = round((t_post - t_recv) * 1000, 2)
@@ -418,8 +476,9 @@ async def _do_take(
         )
 
         # Дамп POST-запроса сохраняем только локально (./data), в чат НЕ отправляем,
-        # чтобы не засорять переписку.
-        if cfg.debug_capture_attempts:
+        # чтобы не засорять переписку. Для предсказанных id дампы не пишем — их
+        # может быть много, и большинство не подтвердится.
+        if cfg.debug_capture_attempts and not predicted:
             try:
                 data = {
                     "csrf_token": csrf_token,
@@ -433,7 +492,12 @@ async def _do_take(
 
         t_confirm = time.perf_counter()
         try:
-            confirmed = await _confirm_taken(client, cfg, order_id)
+            if predicted:
+                # Предсказанные id подтверждаем дешевле: большинство из них ещё
+                # не существуют, а лишние GET на limits-страницу приближают блок.
+                confirmed = await _confirm_taken(client, cfg, order_id, attempts=2, delay=0.25)
+            else:
+                confirmed = await _confirm_taken(client, cfg, order_id)
         except SessionExpired:
             confirmed = False
         metrics.record(
@@ -449,10 +513,15 @@ async def _do_take(
             ws.taken_order_ids.add(order_id)
             # Заявка сразу занимает слот: не ждём следующей сверки с demands.
             ws.demands_ids.add(order_id)
-            await notify(f"✅ Взята заявка #{order_id} (HTTP)")
-            await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
-        else:
+            if predicted:
+                await notify(f"🎯 Поймал предсказанную заявку #{order_id} (HTTP)")
+            else:
+                await notify(f"✅ Взята заявка #{order_id} (HTTP)")
+            if cfg.debug:
+                await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
+        elif not predicted:
             await notify(f"⚠️ Заявку #{order_id} не удалось подтвердить — похоже, её забрали раньше нас.")
+        return confirmed
     finally:
         inflight.discard(order_id)
 
@@ -488,7 +557,8 @@ async def demands_loop(client: PayoutClient, cfg: Config, ws: WorkerState, notif
                     await notify(
                         f"ℹ️ Заявка #{oid}: статус «{status}» — убираю из очереди, слот свободен."
                     )
-                    await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
+                    if cfg.debug:
+                        await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
             # Заявки, которых мы не брали (автовыдача площадки) — тоже занимают слот.
             auto = sorted(in_work - stale - ws.taken_order_ids)
             if auto:
@@ -496,7 +566,8 @@ async def demands_loop(client: PayoutClient, cfg: Config, ws: WorkerState, notif
                     f"📦 Автовыдача: {_ids_text(auto)} уже в работе "
                     f"(площадка выдала без нашего взятия)."
                 )
-                await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
+                if cfg.debug:
+                    await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
         for _ in range(max(1, cfg.demands_sync_s)):
             if not (ws.running and ws.mode == "take"):
                 break
@@ -520,11 +591,12 @@ async def watch_loop(
     if rows is not None:
         ws.demands_ids = in_work_ids(rows)
         ws.taken_order_ids.intersection_update(ws.demands_ids)
-        await notify(
-            f"📊 Сверка с площадкой: в работе уже "
-            f"{len(ws.demands_ids)}/{cfg.target_queue_size} заявок "
-            f"(цель задаётся TARGET_QUEUE_SIZE)."
-        )
+        if cfg.debug:
+            await notify(
+                f"📊 Сверка с площадкой: в работе уже "
+                f"{len(ws.demands_ids)}/{cfg.target_queue_size} заявок "
+                f"(цель задаётся TARGET_QUEUE_SIZE)."
+            )
     prev_ids: set = set()
 
     while ws.running and ws.mode == "watch":
@@ -541,6 +613,9 @@ async def watch_loop(
             await notify("⚠️ Сессия слетела. Останавливаю наблюдение. Запусти кабинет заново (/run).")
             break
         except BlockedError as exc:
+            # Блокировка (403/антибот, Cloudflare): останавливаем наблюдение и
+            # просим run_worker сбросить cookies и переавторизоваться (needs_reauth).
+            ws.needs_reauth = True
             ws.running = False
             await notify(f"⛔ {exc}")
             break
@@ -577,6 +652,117 @@ async def watch_loop(
         prev_ids = ids
         ws.last_status = f"watch(http): заявок на странице={len(rows)}"
         await asyncio.sleep(_sleep_ms(cfg.reload_min_ms, cfg.reload_max_ms))
+
+
+def _observe_queue(ws: WorkerState, rows: list[dict]) -> None:
+    """Запоминает из HTML очереди общий csrf_token и «якорь» — максимальный id.
+
+    При первом наблюдении курсор предсказателя (ws.last_order_id) ставим в этот
+    максимальный id; дальше его двигает predict_loop. ws.observed_anchor — максимум
+    реально увиденных id (по нему ограничиваем забегание вперёд).
+    """
+    ids = [int(r["id"]) for r in rows if str(r.get("id", "")).isdigit()]
+    if not ids:
+        return
+    csrf = next((r.get("csrf_token") for r in rows if r.get("csrf_token")), None)
+    if csrf:
+        ws.last_csrf_token = csrf
+    top = max(ids)
+    if top > ws.observed_anchor:
+        ws.observed_anchor = top
+        ws.predictive_rounds = 0  # увидели новую заявку — снова можно бежать вперёд
+    if ws.last_order_id == 0:
+        ws.last_order_id = top
+
+
+def _fire_predicted_window(
+    client: PayoutClient,
+    cfg: Config,
+    account,
+    ws: WorkerState,
+    notify,
+    metrics: Metrics,
+    inflight: set,
+    take_tasks: set,
+) -> list:
+    """Шлёт ОДНО окно предсказаний: ws.last_order_id+1 … ws.last_order_id+N.
+
+    Курсор сдвигается на наибольший id окна, поэтому следующее окно начнётся сразу
+    за ним — это и есть «взять самый большой id и продолжить с него». Возвращает
+    список запущенных задач, чтобы можно было дождаться их результата.
+    """
+    csrf = ws.last_csrf_token
+    if not csrf or ws.last_order_id <= 0:
+        return []
+    start = ws.last_order_id
+    tasks = []
+    for n in range(1, cfg.predictive_take_count + 1):
+        pid = str(start + n)
+        if (
+            pid in inflight
+            or pid in ws.demands_ids
+            or pid in ws.taken_order_ids
+            or pid in ws.predictive_sent
+        ):
+            continue
+        ws.predictive_sent.add(pid)
+        inflight.add(pid)
+        row = {"id": pid, "csrf_token": csrf, "access_key": ""}
+        task = asyncio.create_task(
+            _do_take(
+                client, cfg, account, ws, notify, metrics, row, {}, time.perf_counter(),
+                inflight, predicted=True,
+            )
+        )
+        take_tasks.add(task)
+        task.add_done_callback(take_tasks.discard)
+        tasks.append(task)
+    ws.last_order_id = start + cfg.predictive_take_count
+    return tasks
+
+
+async def predict_loop(
+    client: PayoutClient,
+    cfg: Config,
+    account,
+    ws: WorkerState,
+    notify,
+    metrics: Metrics,
+    inflight: set,
+    take_tasks: set,
+) -> None:
+    """Превентивный поиск будущих заявок окнами по PREDICTIVE_TAKE_COUNT.
+
+    Пока есть csrf_token и курсор: шлём окно take_payout на следующие N id. Если
+    окно целиком неудачное — курсор уже сдвинут на наибольший id окна, и мы шлём
+    следующее окно, и так далее, пока не поймаем заявку. Ограничение — не забегать
+    дальше PREDICTIVE_TAKE_LOOKAHEAD от реально увиденного id.
+    """
+    while ws.running and ws.mode == "take":
+        if not cfg.predictive_take or ws.last_order_id <= 0 or not ws.last_csrf_token:
+            await asyncio.sleep(0.2)
+            continue
+
+        look = cfg.predictive_take_lookahead
+        if look > 0 and ws.last_order_id - ws.observed_anchor > look:
+            # Убежали слишком далеко от реально увиденных заявок — ждём новую
+            # (её наблюдение сбросит observed_anchor/rounds, и поиск продолжится).
+            await asyncio.sleep(0.3)
+            continue
+
+        tasks = _fire_predicted_window(
+            client, cfg, account, ws, notify, metrics, inflight, take_tasks
+        )
+        if tasks:
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            if any(o is True for o in outcomes):
+                ws.predictive_rounds = 0
+            else:
+                ws.predictive_rounds += 1
+
+        gap = cfg.predictive_take_gap_ms / 1000
+        if gap:
+            await asyncio.sleep(gap)
 
 
 async def _poll_loop(
@@ -616,6 +802,9 @@ async def _poll_loop(
             await notify("⚠️ Сессия слетела во время взятия заявок. Останавливаю. Запусти кабинет заново (/run).")
             return
         except BlockedError as exc:
+            # Блокировка (403/антибот, Cloudflare): останавливаем взятие и просим
+            # run_worker сбросить cookies и переавторизоваться (needs_reauth).
+            ws.needs_reauth = True
             ws.running = False
             await notify(f"⛔ {exc}")
             return
@@ -633,6 +822,10 @@ async def _poll_loop(
             "since_prev_get_ms": round((t_recv - prev_get) * 1000, 2) if prev_get else None,
         }
         prev_get = t_recv
+
+        # Наблюдение очереди: запоминаем csrf_token и якорь (макс. увиденный id).
+        # Само превентивное взятие будущих id делает отдельный цикл predict_loop.
+        _observe_queue(ws, rows)
 
         # Берём первую заявку, которой ещё нет в работе и которую мы не отправляли.
         # Проверка и пометка inflight идут БЕЗ await, значит атомарны для event loop —
@@ -751,7 +944,7 @@ async def take_loop(
         # копятся и бот пишет «в работе 10» при реальной 1.
         in_work = in_work_ids(rows)
         stale_taken = taken_before - in_work
-        if stale_taken:
+        if stale_taken and cfg.debug:
             await notify(
                 f"🧹 Память: убираю {len(stale_taken)} заявок, которых уже нет "
                 f"в работе на площадке: {_ids_text(stale_taken)}."
@@ -759,12 +952,13 @@ async def take_loop(
         ws.taken_order_ids.difference_update(stale_taken)
         ws.demands_ids = in_work
         free = max(0, cfg.target_queue_size - len(ws.demands_ids))
-        await notify(
-            f"📊 Сверка с площадкой: в работе уже "
-            f"{len(ws.demands_ids)}/{cfg.target_queue_size} заявок"
-            f"{': ' + _ids_text(ws.demands_ids) if ws.demands_ids else ''}. "
-            f"Возьму ещё {free}."
-        )
+        if cfg.debug:
+            await notify(
+                f"📊 Сверка с площадкой: в работе уже "
+                f"{len(ws.demands_ids)}/{cfg.target_queue_size} заявок"
+                f"{': ' + _ids_text(ws.demands_ids) if ws.demands_ids else ''}. "
+                f"Возьму ещё {free}."
+            )
     status_task = asyncio.create_task(demands_loop(client, cfg, ws, notify))
     inflight: set = set()
     take_tasks: set = set()
@@ -777,17 +971,26 @@ async def take_loop(
     # Живой ответ на /reset_session: пока флаг поднят, слоты считаются пустыми —
     # воркер должен сделать свежую сверку с площадкой и только потом брать заявки.
     resync_task = asyncio.create_task(resync_demands_loop(client, cfg, ws, notify))
+    # Превентивный поиск будущих id: отдельный фон, шагающий вперёд окнами.
+    predict_task = asyncio.create_task(
+        predict_loop(client, cfg, account, ws, notify, metrics, inflight, take_tasks)
+    )
     try:
         await asyncio.gather(*poll_tasks)
     finally:
         status_task.cancel()
         resync_task.cancel()
+        predict_task.cancel()
         try:
             await status_task
         except (asyncio.CancelledError, Exception):
             pass
         try:
             await resync_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        try:
+            await predict_task
         except (asyncio.CancelledError, Exception):
             pass
         # Гасим незавершённые взятия до закрытия клиента (иначе — "client closed").
@@ -797,11 +1000,60 @@ async def take_loop(
             await asyncio.gather(*take_tasks, return_exceptions=True)
 
 
+async def _run_hot_loop(cfg: Config, account, ws: WorkerState, notify, notify_file, metrics, cookies) -> None:
+    """Один заход горячего цикла на готовых cookies. Возвращается, когда цикл сам
+    завершился (ws.running=False внутри) — например, после блокировки/сбоя сессии."""
+    client = PayoutClient(cfg, cookies)
+    ws.logged_in = True
+    try:
+        await notify("🚀 HTTP-цикл запущен (браузер в горячем цикле не используется).")
+        if ws.mode == "watch":
+            await watch_loop(client, cfg, account, ws, notify, notify_file, metrics)
+        else:
+            await take_loop(client, cfg, account, ws, notify, notify_file, metrics)
+    finally:
+        await client.aclose()
+        ws.logged_in = False
+
+
+async def _recover_from_block(cfg: Config, account, ws: WorkerState, notify, notify_file) -> bool:
+    """Сброс cookies + повторная браузерная авторизация после блокировки (403/антибот).
+
+    Удаляет сохранённую сессию кабинета (auth.json) и проходит авторизацию с нуля:
+    свежий cf_clearance обычно снимает блок. Число подряд неудачных переавторизаций
+    ограничено MAX_BLOCK_REAUTH, чтобы не зациклиться. Возвращает True, если удалось
+    получить рабочие cookies.
+    """
+    if ws.reauth_attempts >= MAX_BLOCK_REAUTH:
+        await notify(
+            f"⛔ Сайт блокирует запросы, переавторизация не помогла "
+            f"({ws.reauth_attempts}/{MAX_BLOCK_REAUTH}). Останавливаюсь — проверьте "
+            "кабинет вручную или вернитесь на WORKER_BACKEND=browser."
+        )
+        return False
+
+    ws.reauth_attempts += 1
+    had_file = _reset_stored_session(account)
+    await notify(
+        "♻️ Сбрасываю сохранённые cookies"
+        f"{' (файл сессии удалён)' if had_file else ' (файла сессии не было)'} "
+        f"и прохожу авторизацию заново — попытка {ws.reauth_attempts}/{MAX_BLOCK_REAUTH}…"
+    )
+    try:
+        cookies = await ensure_session(cfg, account, ws, notify, notify_file, force_reauth=True)
+    except BlockedError as exc:
+        await notify(f"⛔ Повторная авторизация тоже заблокирована: {exc}")
+        return False
+    return bool(cookies)
+
+
 async def run_worker(cfg: Config, account, ws: WorkerState, notify, notify_file) -> None:
     """Воркер ОДНОГО кабинета. Живёт постоянно: ждёт ws.running=True, чтобы начать работу.
 
     Горячий цикл — на httpx (без браузера). Браузер поднимается только если
     сохранённая сессия кабинета недействительна, и только для разовой авторизации.
+    При блокировке (403/антибот) воркер сам сбрасывает cookies кабинета и проходит
+    авторизацию заново (см. _recover_from_block).
     Все уведомления помечаются именем кабинета, чтобы было видно, чья это заявка.
     """
     metrics = Metrics(cfg)
@@ -821,24 +1073,36 @@ async def run_worker(cfg: Config, account, ws: WorkerState, notify, notify_file)
             cookies = await ensure_session(cfg, account, ws, acct_notify, acct_notify_file)
         except BlockedError as exc:
             await acct_notify(f"⛔ {exc}")
-            ws.running = False
+            cookies = None
+            ws.needs_reauth = True
+
+        # Проверка сессии или горячий цикл упёрлись в блокировку: сбрасываем
+        # cookies кабинета и проходим авторизацию заново.
+        if ws.needs_reauth:
+            ws.needs_reauth = False
+            if not await _recover_from_block(cfg, account, ws, acct_notify, acct_notify_file):
+                ws.running = False
             continue
 
         if not cookies:
             ws.running = False
             continue
 
-        client = PayoutClient(cfg, cookies)
-        ws.logged_in = True
-        try:
-            await acct_notify("🚀 HTTP-цикл запущен (браузер в горячем цикле не используется).")
-            if ws.mode == "watch":
-                await watch_loop(client, cfg, account, ws, acct_notify, acct_notify_file, metrics)
-            else:
-                await take_loop(client, cfg, account, ws, acct_notify, acct_notify_file, metrics)
-        finally:
-            await client.aclose()
-            ws.logged_in = False
+        t_started = time.monotonic()
+        await _run_hot_loop(cfg, account, ws, acct_notify, acct_notify_file, metrics, cookies)
+
+        # Если цикл реально проработал какое-то время, значит блок позади — только
+        # тогда обнуляем счётчик переавторизаций (иначе можно зациклиться на
+        # быстрых повторных блокировках).
+        if time.monotonic() - t_started > 30:
+            ws.reauth_attempts = 0
+
+        # Горячий цикл мог остановиться из-за блокировки — переавторизуемся и продолжим.
+        if ws.needs_reauth:
+            ws.needs_reauth = False
+            if not await _recover_from_block(cfg, account, ws, acct_notify, acct_notify_file):
+                ws.running = False
+            continue
 
 
 

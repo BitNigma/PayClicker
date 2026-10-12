@@ -10,6 +10,7 @@ ensure_logged_in гоняем на фейковых Page/BrowserContext (тол�
     на капчу — сессия НЕ сохраняется, дамп уходит в Telegram.
 """
 import asyncio
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ from app.browser_worker import (
     _is_turnstile_frame_url,
     _looks_like_cabinet,
     _looks_like_login_form,
+    _send_debug_dump,
     ensure_logged_in,
 )
 from app.state import WorkerState
@@ -187,6 +189,8 @@ def make_world(**kw):
         # маленький таймаут ожидания формы, чтобы тесты шли быстро (по умолчанию в
         # реальном Config он 90 сек, но в юнит-тестах ждать не нужно).
         login_form_timeout_s=kw.pop("login_form_timeout_s", 2),
+        # отладочные дампы в Telegram включены (как в проде по умолчанию)
+        debug=kw.pop("debug", True),
     )
     account = SimpleNamespace(
         index=1,
@@ -601,6 +605,36 @@ class TurnstileClickTest(unittest.TestCase):
         self.assertTrue(asyncio.run(_click_turnstile(page)))
         # Хелпер делает один клик за вызов — повтор контролирует вызывающий цикл.
         self.assertEqual(len(page.clicks), 2)
+
+
+class DebugDumpTest(unittest.TestCase):
+    """DEBUG=false: дампы сохраняются локально, но в Telegram не шлются (не спамим)."""
+
+    def _dump(self, debug):
+        page = FakePage()
+        page._url = QUEUE_URL
+        page._html = LOGIN_HTML
+        col = Collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = SimpleNamespace(log_path=str(Path(tmp) / "actions.log"), debug=debug)
+            html = asyncio.run(
+                _send_debug_dump(page, cfg, col.notify, col.notify_file, "unit", "caption")
+            )
+            saved = sorted(Path(tmp).glob("debug_unit_*.html"))
+        return html, col, saved
+
+    def test_debug_off_saves_locally_but_silent(self):
+        html, col, saved = self._dump(debug=False)
+        self.assertEqual(html, LOGIN_HTML)
+        self.assertEqual(col.messages, [])  # в Telegram ничего не ушло
+        self.assertEqual(col.files, [])
+        self.assertTrue(saved, "HTML-дамп должен сохраниться на диск для разбора")
+
+    def test_debug_on_sends_to_telegram(self):
+        html, col, saved = self._dump(debug=True)
+        self.assertTrue(col.messages)
+        self.assertEqual(len(col.files), 2)  # HTML + PNG
+        self.assertTrue(saved)
 
 
 if __name__ == "__main__":

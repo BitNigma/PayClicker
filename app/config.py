@@ -54,6 +54,30 @@ class Config:
     # перед /signin может занимать ~20+ секунд, поэтому ждать нужно с запасом.
     login_form_timeout_s: int = 90
 
+    # Превентивное (предсказательное) взятие: поймав id текущей заявки, бот сразу
+    # пробует взять следующие id (id на площадке идут по порядку), не дожидаясь их
+    # появления в HTML очереди. См. http_worker._maybe_fire_predicted.
+    # По умолчанию выключено (включается PREDICTIVE_TAKE=true): это доп. POST-нагрузка,
+    # которую стоит включать осознанно.
+    predictive_take: bool = False
+    # Сколько «будущих» id пробовать за раз (от anchor+1 до anchor+N). Площадка
+    # всё равно не даст держать в работе больше своего лимита (≈10), поэтому можно
+    # смело слать с запасом: за пару секунд очередь улетает вперёд примерно на 25 id.
+    predictive_take_count: int = 25
+    # Пауза между окнами предсказаний, мс: если окно целиком неудачное, курсор
+    # сдвигается на наибольший id окна и шлётся следующее окно — эта пауза не даёт
+    # превратиться в бесконечный шторм POST-запросов.
+    predictive_take_gap_ms: int = 300
+    # На сколько id разрешено забежать вперёд от последнего РЕАЛЬНО увиденного в
+    # очереди id. Дойдя до предела, предсказатель приостанавливается и ждёт новую
+    # заявку (чтобы не «сжигать» запросы по несуществующим id). 0 — без ограничения.
+    predictive_take_lookahead: int = 200
+
+    # Отладочные сообщения в Telegram: HTML/PNG-дампы страниц, подробные сводки
+    # очереди. Включается DEBUG=true. При DEBUG=false бот шлёт только важное
+    # (взятые заявки, ошибки, блокировки, 2FA) — чтобы не спамить.
+    debug: bool = True
+
     @property
     def allowed_chat_id(self) -> int:
         """Первый (основной) админ — для обратной совместимости и логов."""
@@ -199,5 +223,12 @@ def load_config() -> Config:
         demands_sync_s=max(1, int(env.get("DEMANDS_SYNC_S", "10"))),
         # сколько секунд ждать форму входа (с учётом Cloudflare-проверки перед /signin)
         login_form_timeout_s=max(1, int(env.get("LOGIN_FORM_TIMEOUT_S", "90"))),
+        # превентивное взятие будущих id (см. Config.predictive_take)
+        predictive_take=env.get("PREDICTIVE_TAKE", "false").lower() == "true",
+        predictive_take_count=max(1, int(env.get("PREDICTIVE_TAKE_COUNT", "25"))),
+        predictive_take_gap_ms=max(0, int(env.get("PREDICTIVE_TAKE_GAP_MS", "300"))),
+        predictive_take_lookahead=int(env.get("PREDICTIVE_TAKE_LOOKAHEAD", "200")),
+        # Отладочные сообщения в Telegram (дампы, подробные сводки). DEBUG=false — тише.
+        debug=env.get("DEBUG", "true").lower() == "true",
     )
 

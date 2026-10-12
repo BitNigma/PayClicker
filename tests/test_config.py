@@ -134,5 +134,56 @@ class DemandsSyncConfigTest(unittest.TestCase):
                 self.assertEqual(load_config().demands_sync_s, 1, f"DEMANDS_SYNC_S={raw}")
 
 
+class PredictiveTakeConfigTest(unittest.TestCase):
+    """PREDICTIVE_TAKE / PREDICTIVE_TAKE_COUNT: превентивное взятие будущих id."""
+
+    BASE_ENV = DemandsSyncConfigTest.BASE_ENV
+
+    def test_disabled_by_default(self):
+        with patch.dict(os.environ, self.BASE_ENV, clear=True):
+            cfg = load_config()
+            self.assertFalse(cfg.predictive_take)
+            self.assertEqual(cfg.predictive_take_count, 25)
+
+    def test_enabled_and_count_override(self):
+        env = dict(self.BASE_ENV, PREDICTIVE_TAKE="true", PREDICTIVE_TAKE_COUNT="8")
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+            self.assertTrue(cfg.predictive_take)
+            self.assertEqual(cfg.predictive_take_count, 8)
+
+    def test_count_minimum_is_one(self):
+        env = dict(self.BASE_ENV, PREDICTIVE_TAKE_COUNT="0")
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(load_config().predictive_take_count, 1)
+
+    def test_gap_and_lookahead_defaults(self):
+        with patch.dict(os.environ, self.BASE_ENV, clear=True):
+            cfg = load_config()
+            self.assertEqual(cfg.predictive_take_gap_ms, 300)
+            self.assertEqual(cfg.predictive_take_lookahead, 200)
+
+    def test_gap_and_lookahead_override(self):
+        env = dict(self.BASE_ENV, PREDICTIVE_TAKE_GAP_MS="50", PREDICTIVE_TAKE_LOOKAHEAD="0")
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+            self.assertEqual(cfg.predictive_take_gap_ms, 50)
+            self.assertEqual(cfg.predictive_take_lookahead, 0)
+
+
+class DebugConfigTest(unittest.TestCase):
+    """DEBUG: отладочные сообщения в Telegram (по умолчанию включены)."""
+
+    BASE_ENV = DemandsSyncConfigTest.BASE_ENV
+
+    def test_default_true(self):
+        with patch.dict(os.environ, self.BASE_ENV, clear=True):
+            self.assertTrue(load_config().debug)
+
+    def test_override_false(self):
+        with patch.dict(os.environ, dict(self.BASE_ENV, DEBUG="false"), clear=True):
+            self.assertFalse(load_config().debug)
+
+
 if __name__ == "__main__":
     unittest.main()
