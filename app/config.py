@@ -72,6 +72,23 @@ class Config:
     # очереди id. Дойдя до предела, предсказатель приостанавливается и ждёт новую
     # заявку (чтобы не «сжигать» запросы по несуществующим id). 0 — без ограничения.
     predictive_take_lookahead: int = 200
+    # Писать ли в ./data дампы и по ПРЕДСКАЗАННЫМ отправкам (обычно нет — их много,
+    # и большинство не подтвердится). Нужно только для отладки предсказателя.
+    predictive_take_dumps: bool = False
+    # ОПЦИОНАЛЬНО: своя (более редкая) пауза GET очереди при предиктиве, мс.
+    # 0 (по умолчанию) — активный горячий цикл: опрос идёт по TAKE_POLL_MIN/MAX_MS
+    # со всеми TAKE_PARALLEL_POLLERS (так заявки ловятся быстрее всего). Если хочется
+    # снизить GET-нагрузку/риск Cloudflare, задайте >0 — тогда опрос станет редким,
+    # а воронка останется одна (заявки компенсирует predict_loop).
+    predictive_take_poll_ms: int = 0
+
+    # Сколько раз ПОВТОРИТЬ POST take_payout, если ответ неоднозначный: заявка ещё
+    # в очереди (still_available) или ответ не распознан (unknown). Успех/«уже
+    # забрали» (taken/gone) не повторяются. Только для РЕАЛЬНЫХ (не предсказанных)
+    # взятий — предсказанные не повторяем, чтобы не устраивать POST-шторм.
+    take_retry_count: int = 2
+    # Пауза между повторными POST, мс.
+    take_retry_delay_ms: int = 120
 
     # Отладочные сообщения в Telegram: HTML/PNG-дампы страниц, подробные сводки
     # очереди. Включается DEBUG=true. При DEBUG=false бот шлёт только важное
@@ -254,6 +271,14 @@ def load_config() -> Config:
         predictive_take_count=max(1, int(env.get("PREDICTIVE_TAKE_COUNT", "25"))),
         predictive_take_gap_ms=max(0, int(env.get("PREDICTIVE_TAKE_GAP_MS", "300"))),
         predictive_take_lookahead=int(env.get("PREDICTIVE_TAKE_LOOKAHEAD", "200")),
+        # Писать дампы и по предсказанным отправкам (для отладки предсказателя).
+        predictive_take_dumps=env.get("PREDICTIVE_TAKE_DUMPS", "false").lower() == "true",
+        # Опциональная редкая пауза опроса при предиктиве (см. Config.predictive_take_poll_ms).
+        # 0 (по умолчанию) — активный горячий GET-цикл (TAKE_POLL_MIN/MAX_MS, все воронки).
+        predictive_take_poll_ms=max(0, int(env.get("PREDICTIVE_TAKE_POLL_MS", "0"))),
+        # Повтор POST при неоднозначном ответе (still_available / unknown).
+        take_retry_count=max(0, int(env.get("TAKE_RETRY_COUNT", "2"))),
+        take_retry_delay_ms=max(0, int(env.get("TAKE_RETRY_DELAY_MS", "120"))),
         # Отладочные сообщения в Telegram (дампы, подробные сводки). DEBUG=false — тише.
         debug=env.get("DEBUG", "true").lower() == "true",
         # Маркеры в теле ответа на POST take_payout (каждое значение — через запятую).

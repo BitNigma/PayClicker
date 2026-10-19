@@ -251,17 +251,32 @@ class PageLooksTest(unittest.TestCase):
         self.assertFalse(_is_challenge_page(LOGIN_HTML))
         self.assertFalse(_is_challenge_page(CABINET_HTML))
 
-    @unittest.skipUnless(any(DATA_DIR.glob("debug_unexpected_after_queue*.html")),
-                         "нет реального дампа Cloudflare-проверки в ./data")
+    # Реальные дампы «сайт отдал проверку вместо кабинета». Оба имени встречаются:
+    # старое debug_unexpected_after_queue_* (на queue_url) и новое
+    # debug_after_login_unexpected_* (после успешного ввода логина/пароля сайт
+    # показал Cloudflare «Один момент…»).
+    _REAL_CHALLENGE_DUMPS = (
+        "debug_unexpected_after_queue*.html",
+        "debug_after_login_unexpected*.html",
+    )
+
+    @unittest.skipUnless(
+        any(DATA_DIR.glob(p) for p in _REAL_CHALLENGE_DUMPS),
+        "нет реального дампа Cloudflare-проверки в ./data",
+    )
     def test_challenge_recognized_in_real_dump(self):
         # Старые дампы могли быть написаны багованной версией, которая помечала
         # обычную форму входа как «неожиданная разметка» (логин-форма там, а не
         # Cloudflare). Проверяем распознавание только на настоящих дампах проверки.
-        for fp in sorted(DATA_DIR.glob("debug_unexpected_after_queue*.html")):
-            html = fp.read_text(encoding="utf-8")
-            if _looks_like_login_form(html) or _looks_like_cabinet(html):
-                continue
-            self.assertTrue(_is_challenge_page(html), fp.name)
+        seen = 0
+        for pattern in self._REAL_CHALLENGE_DUMPS:
+            for fp in sorted(DATA_DIR.glob(pattern)):
+                html = fp.read_text(encoding="utf-8")
+                if _looks_like_login_form(html) or _looks_like_cabinet(html):
+                    continue
+                self.assertTrue(_is_challenge_page(html), fp.name)
+                seen += 1
+        self.assertTrue(seen, "не нашлось ни одного реального дампа проверки")
 
 
 class EnsureLoggedInTest(unittest.TestCase):
@@ -441,6 +456,64 @@ class EnsureLoggedInTest(unittest.TestCase):
         joined = "\n".join(col.messages)
         self.assertIn("не похожа на кабинет", joined)
         self.assertTrue(col.files)
+
+    def test_cloudflare_challenge_after_login_is_waited_out(self):
+        """После успешного ввода логина/пароля сайт отдал Cloudflare-проверку
+        «Один момент…» (ровно это видно в реальном дампе
+        debug_after_login_unexpected_*). Это НЕ провал: бот пережидает проверку
+        и сохраняет сессию, а не помечает вход неудачей — иначе горячий цикл
+        так и не запускается."""
+        page, context, cfg, account, ws, col = make_world()
+
+        async def goto_handler(url):
+            page._url = SITE_URL
+            page._html = LOGIN_HTML
+
+        async def after_login():
+            # Cloudflare-проверка появляется ТОЛЬКО после отправки формы входа.
+            page._url = QUEUE_URL
+            page._html = CABINET_HTML
+            page.content_hook, _ = make_challenge_then(page, challenge_polls=2)
+
+        page.goto_handler = goto_handler
+        page.after_login_handler = after_login
+        with mock.patch("asyncio.sleep", _instant_sleep):
+            ok = asyncio.run(ensure_logged_in(page, context, cfg, account, ws, col.notify, col.notify_file))
+        self.assertTrue(ok)
+        self.assertTrue(ws.logged_in)
+        self.assertEqual(context.storage_calls, [STORAGE_PATH])
+        self.assertFalse(any("after_login_unexpected" in fp for fp, _ in col.files))
+
+    def test_cloudflare_after_login_then_signin_is_failure(self):
+        """Если после Cloudflare-проверки сайт вернул на /signin — вход НЕ удался:
+        сессия не сохраняется, уходит дамп after_login."""
+        page, context, cfg, account, ws, col = make_world()
+        calls = {"n": 0}
+
+        async def goto_handler(url):
+            page._url = SITE_URL
+            page._html = LOGIN_HTML
+
+        async def content_hook():
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return CHALLENGE_HTML
+            page._url = SITE_URL     # проверка не прошла — снова страница входа
+            return LOGIN_HTML
+
+        async def after_login():
+            page._url = "https://x/check"   # ещё не /signin, но и не кабинет
+            page._html = LOGIN_HTML
+            page.content_hook = content_hook
+
+        page.goto_handler = goto_handler
+        page.after_login_handler = after_login
+        with mock.patch("asyncio.sleep", _instant_sleep):
+            ok = asyncio.run(ensure_logged_in(page, context, cfg, account, ws, col.notify, col.notify_file))
+        self.assertFalse(ok)
+        self.assertFalse(ws.logged_in)
+        self.assertEqual(context.storage_calls, [])
+        self.assertTrue(any("after_login" in fp for fp, _ in col.files))
 
     def test_successful_login_with_2fa(self):
         page, context, cfg, account, ws, col = make_world()

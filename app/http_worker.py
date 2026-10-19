@@ -60,6 +60,19 @@ class BlockedError(Exception):
 # блоке: если помогает — счётчик сбрасывается при первой же рабочей сессии.
 MAX_BLOCK_REAUTH = max(1, int(os.environ.get("BLOCK_REAUTH_ATTEMPTS", "3")))
 
+# Как часто максимум слать в Telegram подтверждение, что превентивные POST уходят
+# (иначе окна каждые PREDICTIVE_TAKE_GAP_MS превратились бы в спам). Секунды.
+PREDICTIVE_NOTIFY_MIN_S = 3.0
+
+# Минимальная пауза между проходами предсказателя, если PREDICTIVE_TAKE_GAP_MS=0.
+# Нужна только чтобы не крутиться вхолостую, когда окно целиком отфильтровано.
+PREDICTIVE_RETRY_MIN_S = 0.05
+
+# Сколько символов тела ответа сохранять в дампе take_request_*.json. Первых 4000
+# мало: там только <head> — тело с таблицей/сообщением не видно. 20000 хватает,
+# чтобы разобрать разметку и подобрать TAKE_SUCCESS_MARKERS / TAKE_GONE_MARKERS.
+TAKE_DUMP_BODY_CHARS = 20000
+
 
 # ------------------------- разбор HTML (регулярки) -------------------------
 _TR_RE = re.compile(r"<tr\b.*?</tr>", re.S | re.I)
@@ -173,12 +186,19 @@ def _classify_take_response(html: str, order_id: str, cfg: Config) -> str:
         return TAKE_REPLY_GONE
     if any(m in low for m in getattr(cfg, "take_success_markers", ())):
         return TAKE_REPLY_TAKEN
-    if _take_form_block(html or "", order_id):
+    block = _take_form_block(html or "", order_id)
+    if block:
         # Строка всё ещё предлагает «Забрать выплату» — проверяем её статус:
-        block_low = _take_form_block(html or "", order_id).lower()
-        if STATUS_IN_WORK_MARKER in block_low:
+        if STATUS_IN_WORK_MARKER in block.lower():
             return TAKE_REPLY_TAKEN
         return TAKE_REPLY_STILL_AVAILABLE
+    # Нашей строки в ответе нет. Если это ВООБЩЕ страница очереди (есть таблица
+    # выплат), значит нашей заявки в очереди больше нет: её забрали (мы/другие)
+    # или её и не было (для предсказанного id). Неизвестно — только если страница
+    # вообще не похожа на очередь (например, редирект на дашборд).
+    page_markers = ("payout-table", "payout-status", "payout-card")
+    if any(m in low for m in page_markers):
+        return TAKE_REPLY_GONE
     return TAKE_REPLY_UNKNOWN
 
 
@@ -384,6 +404,39 @@ def _sleep_ms(lo: int, hi: int) -> float:
     return random.uniform(lo, hi) / 1000
 
 
+def _poll_wait(cfg: Config) -> float:
+    """Пауза между GET очереди в _poll_loop (секунды).
+
+    По умолчанию (`predictive_take_poll_ms = 0`) — АКТИВНЫЙ горячий цикл:
+    обычный `TAKE_POLL_MIN/MAX_MS`. Предиктив лишь ДОБАВЛЯЕТ спекулятивные POST,
+    а не заменяет опрос: именно активный GET ловит реальные заявки и обновляет
+    якорь/CSRF. Если явно задан `PREDICTIVE_TAKE_POLL_MS > 0` — опрос становится
+    редким (джиттер до +50%), чтобы снизить GET-нагрузку/риск Cloudflare.
+    """
+    base = getattr(cfg, "predictive_take_poll_ms", 0) or 0
+    if cfg.predictive_take and base > 0:
+        return _sleep_ms(base, int(base * 1.5))
+    return _sleep_ms(cfg.take_poll_min_ms, cfg.take_poll_max_ms)
+
+
+def _effective_pollers(cfg: Config) -> int:
+    """Сколько воронок опроса реально запускать.
+
+    По умолчанию — все `TAKE_PARALLEL_POLLERS`: горячий GET-цикл работает на полную
+    (предиктив лишь ДОБАВЛЯЕТ POST, не заменяя опрос).
+
+    Воронки сводим к одной ТОЛЬКО в «тихом» режиме, т.е. когда заданный
+    `PREDICTIVE_TAKE_POLL_MS` ЯВНО больше обычного интервала (`TAKE_POLL_MAX_MS`).
+    Если же он меньше/равен (например, 1 мс — «максимально быстро»), все воронки
+    остаются: иначе настройка «ускорить» парадоксально уменьшала бы их число.
+    """
+    pollers = max(1, cfg.take_parallel_pollers)
+    base = getattr(cfg, "predictive_take_poll_ms", 0) or 0
+    if cfg.predictive_take and pollers > 1 and base > cfg.take_poll_max_ms:
+        return 1
+    return pollers
+
+
 async def _session_ok(client: PayoutClient) -> bool:
     try:
         await client.fetch_queue()
@@ -449,6 +502,7 @@ def _dump_take_request(
     data: dict,
     response: httpx.Response,
     server_reply: str | None = None,
+    predicted: bool = False,
 ) -> Path:
     """Сохраняет фактический HTTP POST и ответ — для сверки с версией на браузере.
 
@@ -457,13 +511,18 @@ def _dump_take_request(
     заявку реально взяли, от случая «такой заявки ещё нет / её забрали раньше».
     Сам бот успех определяет не по этому ответу, а сверкой со страницей demands
     (см. _confirm_taken); здесь — только диагностика.
+
+    predicted=True — дамп предсказательной отправки: в имени файла добавляем
+    `_pred`, чтобы их было видно отдельно (пишутся только при PREDICTIVE_TAKE_DUMPS).
     """
     d = Path(cfg.log_path).parent
     d.mkdir(parents=True, exist_ok=True)
-    fp = d / f"take_request_http_{order_id}_{int(time.time())}.json"
+    suffix = "_pred" if predicted else ""
+    fp = d / f"take_request_http_{order_id}_{int(time.time())}{suffix}.json"
     body = _safe_text(response)
     payload = {
         "transport": "httpx",
+        "predicted": predicted,
         "request": {
             "url": cfg.queue_url,
             "method": "POST",
@@ -474,7 +533,7 @@ def _dump_take_request(
             "url": str(response.url),
             "status": response.status_code,
             "content_type": response.headers.get("content-type", ""),
-            "text_head": body[:4000],
+            "text_head": body[:TAKE_DUMP_BODY_CHARS],
             "server_reply": server_reply,
         },
     }
@@ -545,90 +604,127 @@ async def _do_take(
     order_id = row["id"]
     csrf_token = row.get("csrf_token")
     access_key = row.get("access_key", "")
+    # Предсказанные id НЕ повторяем (их много; повтор = POST-шторм). Для реальных
+    # взятий повторяем POST, если ответ неоднозначен: заявка ещё в очереди
+    # (still_available) или ответ не распознан (unknown). taken/gone не повторяем.
+    retry_limit = 0 if predicted else max(0, cfg.take_retry_count)
+    retry_delay = max(0, cfg.take_retry_delay_ms) / 1000
+    server_reply = TAKE_REPLY_UNKNOWN
     try:
-        t_post = time.perf_counter()
-        try:
-            response = await client.take_payout(order_id, csrf_token, access_key)
-        except Exception as exc:
-            logger.warning("[%s] POST take_payout для #%s не удался: %s", account.name, order_id, exc)
-            return False
-        t_post_done = time.perf_counter()
-
-        # Разбор ТЕЛА ответа сервера: помогает понять/озвучить, что произошло
-        # (взяли / заявки нет / ещё в очереди). Это не замена подтверждению через
-        # demands, а пояснение к нему — см. _classify_take_response.
-        server_reply = _classify_take_response(_safe_text(response), order_id, cfg)
-
-        saw_to_sent = round((t_post - t_recv) * 1000, 2)
-        metrics.record(
-            event="take",
-            account=account.name,
-            account_index=account.index,
-            order_id=order_id,
-            poll_rtt_ms=timing.get("poll_rtt_ms"),
-            parse_ms=timing.get("parse_ms"),
-            since_prev_get_ms=timing.get("since_prev_get_ms"),
-            saw_to_sent_ms=saw_to_sent,
-            py_overhead_ms=round(saw_to_sent - (timing.get("parse_ms") or 0.0), 2),
-            submit_rtt_ms=round((t_post_done - t_post) * 1000, 2),
-            http_status=response.status_code,
-            server_reply=server_reply,
-        )
-        if cfg.debug:
-            logger.info(
-                "[%s] ответ сервера на POST #%s: %s (%s)",
-                account.name, order_id, server_reply, _TAKE_REPLY_TEXT.get(server_reply, ""),
-            )
-
-        # Дамп POST-запроса сохраняем только локально (./data), в чат НЕ отправляем,
-        # чтобы не засорять переписку. Для предсказанных id дампы не пишем — их
-        # может быть много, и большинство не подтвердится.
-        if cfg.debug_capture_attempts and not predicted:
+        for attempt in range(1, retry_limit + 2):
+            t_post = time.perf_counter()
             try:
-                data = {
-                    "csrf_token": csrf_token,
-                    "act": "take_payout",
-                    "payout_id": order_id,
-                    "access_key": access_key,
-                }
-                _dump_take_request(cfg, order_id, data, response, server_reply)
-            except Exception:
-                logger.exception("Не удалось сохранить дамп запроса для #%s", order_id)
+                response = await client.take_payout(order_id, csrf_token, access_key)
+            except Exception as exc:
+                logger.warning("[%s] POST take_payout для #%s не удался: %s", account.name, order_id, exc)
+                return False
+            t_post_done = time.perf_counter()
 
-        t_confirm = time.perf_counter()
-        try:
-            if predicted:
-                # Предсказанные id подтверждаем дешевле: большинство из них ещё
-                # не существуют, а лишние GET на limits-страницу приближают блок.
-                confirmed = await _confirm_taken(client, cfg, order_id, attempts=2, delay=0.25)
-            else:
-                confirmed = await _confirm_taken(client, cfg, order_id)
-        except SessionExpired:
-            confirmed = False
-        metrics.record(
-            event="take_result",
-            account=account.name,
-            account_index=account.index,
-            order_id=order_id,
-            confirmed=confirmed,
-            server_reply=server_reply,
-            confirm_ms=round((time.perf_counter() - t_confirm) * 1000, 2),
-        )
-        if confirmed:
-            ws.taken_count += 1
-            ws.taken_order_ids.add(order_id)
-            # Заявка сразу занимает слот: не ждём следующей сверки с demands.
-            ws.demands_ids.add(order_id)
-            if predicted:
-                await notify(f"🎯 Поймал предсказанную заявку #{order_id} (HTTP)")
-            else:
-                await notify(f"✅ Взята заявка #{order_id} (HTTP)")
+            # Разбор ТЕЛА ответа сервера: помогает понять/озвучить, что произошло
+            # (взяли / заявки нет / ещё в очереди). Это не замена подтверждению через
+            # demands, а пояснение к нему — см. _classify_take_response.
+            server_reply = _classify_take_response(_safe_text(response), order_id, cfg)
+
+            saw_to_sent = round((t_post - t_recv) * 1000, 2)
+            metrics.record(
+                event="take",
+                account=account.name,
+                account_index=account.index,
+                order_id=order_id,
+                poll_rtt_ms=timing.get("poll_rtt_ms"),
+                parse_ms=timing.get("parse_ms"),
+                since_prev_get_ms=timing.get("since_prev_get_ms"),
+                saw_to_sent_ms=saw_to_sent,
+                py_overhead_ms=round(saw_to_sent - (timing.get("parse_ms") or 0.0), 2),
+                submit_rtt_ms=round((t_post_done - t_post) * 1000, 2),
+                http_status=response.status_code,
+                server_reply=server_reply,
+                predicted=predicted,
+                attempt=attempt,
+            )
             if cfg.debug:
-                await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
-        elif not predicted:
-            # Поясняем причину по телу ответа сервера: «нет такой заявки» — это
-            # нормальная гонка (её забрали раньше нас), а «ещё в очереди» означает,
-            # что наш POST не сработал — стоит присмотреться.
+                logger.info(
+                    "[%s] ответ сервера на POST #%s (попытка %d/%d): %s (%s)%s",
+                    account.name, order_id, attempt, retry_limit + 1, server_reply,
+                    _TAKE_REPLY_TEXT.get(server_reply, ""),
+                    " [предсказание]" if predicted else "",
+                )
+
+            # Дамп POST-запроса — только локально (./data), в чат НЕ отправляем.
+            # Пишем один дамп на такт (первая попытка): имя файла содержит только
+            # секунду, повторы затёрли бы его. Предсказанные — при PREDICTIVE_TAKE_DUMPS.
+            if cfg.debug_capture_attempts and attempt == 1 and (
+                not predicted or cfg.predictive_take_dumps
+            ):
+                try:
+                    data = {
+                        "csrf_token": csrf_token,
+                        "act": "take_payout",
+                        "payout_id": order_id,
+                        "access_key": access_key,
+                    }
+                    _dump_take_request(cfg, order_id, data, response, server_reply, predicted)
+                except Exception:
+                    logger.exception("Не удалось сохранить дамп запроса для #%s", order_id)
+
+            t_confirm = time.perf_counter()
+            try:
+                if predicted:
+                    # Предсказанные id подтверждаем дешевле: большинство из них ещё
+                    # не существуют, а лишние GET на limits-страницу приближают блок.
+                    confirmed = await _confirm_taken(client, cfg, order_id, attempts=2, delay=0.25)
+                elif server_reply == TAKE_REPLY_STILL_AVAILABLE:
+                    # Заведомо «не взяли» (форма ещё на странице): не ждём 1.6 с,
+                    # одна быстрая проверка — чтобы сразу перейти к повтору POST.
+                    confirmed = await _confirm_taken(client, cfg, order_id, attempts=1, delay=0.0)
+                else:
+                    confirmed = await _confirm_taken(client, cfg, order_id)
+            except SessionExpired:
+                confirmed = False
+            metrics.record(
+                event="take_result",
+                account=account.name,
+                account_index=account.index,
+                order_id=order_id,
+                confirmed=confirmed,
+                server_reply=server_reply,
+                predicted=predicted,
+                attempt=attempt,
+                confirm_ms=round((time.perf_counter() - t_confirm) * 1000, 2),
+            )
+            if confirmed:
+                ws.taken_count += 1
+                ws.taken_order_ids.add(order_id)
+                # Заявка сразу занимает слот: не ждём следующей сверки с demands.
+                ws.demands_ids.add(order_id)
+                if predicted:
+                    await notify(f"🎯 Поймал предсказанную заявку #{order_id} (HTTP)")
+                else:
+                    await notify(f"✅ Взята заявка #{order_id} (HTTP)")
+                if cfg.debug:
+                    await notify(f"🔄 Очередь изменилась. {_queue_snapshot_text(cfg, ws)}")
+                return True
+
+            # Не подтвердилось. При неоднозначном ответе (заявка ещё в очереди или
+            # ответ не распознан) повторяем POST ограниченно: возможно, проиграли
+            # гонку на волоске и со следующей попытки возьмём. taken/gone — не повторяем.
+            if attempt <= retry_limit and server_reply in (
+                TAKE_REPLY_STILL_AVAILABLE, TAKE_REPLY_UNKNOWN
+            ):
+                if cfg.debug:
+                    logger.info(
+                        "[%s] #%s не подтверждено (%s) — повтор POST, попытка %d/%d",
+                        account.name, order_id, server_reply, attempt + 1, retry_limit + 1,
+                    )
+                if retry_delay:
+                    await asyncio.sleep(retry_delay)
+                continue
+            break
+
+        # Не взяли: попытки исчерпаны или повтор не нужен. Сообщаем один раз.
+        if not predicted:
+            # «нет такой заявки» — нормальная гонка (её забрали раньше нас), а
+            # «ещё в очереди» означает, что наш POST не сработал — стоит присмотреться.
             reason = _TAKE_REPLY_TEXT.get(server_reply, "")
             if server_reply == TAKE_REPLY_STILL_AVAILABLE:
                 await notify(
@@ -639,7 +735,7 @@ async def _do_take(
                 await notify(
                     f"ℹ️ Заявку #{order_id} не взяли: {reason or 'похоже, её забрали раньше нас'}."
                 )
-        return confirmed
+        return False
     finally:
         inflight.discard(order_id)
 
@@ -788,8 +884,13 @@ def _observe_queue(ws: WorkerState, rows: list[dict]) -> None:
     top = max(ids)
     if top > ws.observed_anchor:
         ws.observed_anchor = top
-        ws.predictive_rounds = 0  # увидели новую заявку — снова можно бежать вперёд
-    if ws.last_order_id == 0:
+        ws.predictive_rounds = 0
+        # «Обнуляем отсчёт пула» от реально увиденной заявки: следующее окно POST
+        # пойдёт на top+1…, а не от «убежавшего» вперёд курсора. Чистим и набор
+        # уже отправленных, чтобы окно от top снова было полным.
+        ws.last_order_id = top
+        ws.predictive_sent.clear()
+    elif ws.last_order_id == 0:
         ws.last_order_id = top
 
 
@@ -814,6 +915,7 @@ def _fire_predicted_window(
         return []
     start = ws.last_order_id
     tasks = []
+    fired: list[str] = []
     for n in range(1, cfg.predictive_take_count + 1):
         pid = str(start + n)
         if (
@@ -839,6 +941,14 @@ def _fire_predicted_window(
         task.add_done_callback(take_tasks.discard)
         task.add_done_callback(lambda _t, _pid=pid: ws.predicted_inflight.discard(_pid))
         tasks.append(task)
+        fired.append(pid)
+    # Всегда логируем окно предсказаний — иначе кажется, что «превентивных
+    # POST нет» (они не дампятся и не шумят уведомлениями по умолчанию).
+    if fired:
+        logger.info(
+            "[%s] 🔮 превентивно: окно #%s…#%s — %d POST take_payout (predicted)",
+            ws.name, fired[0], fired[-1], len(fired),
+        )
     ws.last_order_id = start + cfg.predictive_take_count
     # Подчищаем набор уже отправленных id: курсор идёт только вперёд, поэтому
     # всё, что не больше старого курсора, больше не актуально (не пухнем в памяти).
@@ -872,6 +982,11 @@ async def predict_loop(
     занятыми слотами — поэтому опрос очереди (_poll_loop) не «слепнет» во время
     пачки предсказаний.
     """
+    last_notice = 0.0
+    # Якорь, про который уже сообщили в Telegram. Пока не появится НОВАЯ реальная
+    # заявка (наблюдение сдвинет observed_anchor), повторять уведомление не нужно —
+    # иначе в чат летело бы одно и то же сообщение и выглядело как дубли.
+    notified_anchor: int | None = None
     while ws.running and ws.mode == "take":
         if not cfg.predictive_take or ws.last_order_id <= 0 or not ws.last_csrf_token:
             await asyncio.sleep(0.2)
@@ -891,16 +1006,40 @@ async def predict_loop(
             ws.last_order_id = ws.observed_anchor
 
         look = cfg.predictive_take_lookahead
-        if look > 0 and ws.last_order_id - ws.observed_anchor > look:
-            # Убежали слишком далеко от реально увиденных заявок — ждём новую
-            # (её наблюдение сбросит observed_anchor/rounds, и поиск продолжится).
-            await asyncio.sleep(gap or 0.3)
+        if look > 0 and ws.observed_anchor > 0 and ws.last_order_id - ws.observed_anchor > look:
+            # Дошли до предела забегания вперёд. РАНЬШЕ здесь просто ждали новую
+            # заявку — и заявки ТЕРЯЛИСЬ: id, который мы уже пробовали, когда он
+            # ещё НЕ существовал, повторно не пробовался (один «прочёс» вперёд —
+            # одна попытка на id). Теперь возвращаемся к якорю и заново обстреливаем
+            # тот же диапазон (retry): так ловим заявку, чей id появился ПОЗЖЕ нашей
+            # первой попытки. Пауза = PREDICTIVE_TAKE_GAP_MS; при 0 берём небольшой пол.
+            ws.last_order_id = ws.observed_anchor
+            ws.predictive_sent.clear()
+            await asyncio.sleep(gap or PREDICTIVE_RETRY_MIN_S)
             continue
 
+        window_start = ws.last_order_id
         tasks = _fire_predicted_window(
             client, cfg, account, ws, notify, metrics, inflight, take_tasks
         )
         if tasks:
+            # Сообщаем в Telegram, что превентивные POST реально уходят, но ТОЛЬКО
+            # один раз на каждый новый реально увиденный id (якорь). Так видно, что
+            # предиктив жив, но чат не забивается одинаковыми сообщениями. Троттлинг
+            # оставлен как доп. предохранитель от частой смены якоря.
+            if (
+                cfg.debug
+                and notify is not None
+                and ws.observed_anchor != notified_anchor
+                and time.monotonic() - last_notice >= PREDICTIVE_NOTIFY_MIN_S
+            ):
+                notified_anchor = ws.observed_anchor
+                last_notice = time.monotonic()
+                window_end = ws.last_order_id
+                await notify(
+                    f"🔮 Превентивно: {len(tasks)} POST take_payout "
+                    f"(окно #{window_start + 1}…#{window_end}, якорь #{ws.observed_anchor})"
+                )
             outcomes = await asyncio.gather(*tasks, return_exceptions=True)
             if any(o is True for o in outcomes):
                 ws.predictive_rounds = 0
@@ -937,7 +1076,7 @@ async def _poll_loop(
         reserved = ws.slots_taken(inflight, ws.predicted_inflight)
         if reserved >= cfg.target_queue_size:
             ws.last_status = f"take(http): очередь полная {reserved}/{cfg.target_queue_size}"
-            await asyncio.sleep(_sleep_ms(cfg.take_poll_min_ms, cfg.take_poll_max_ms))
+            await asyncio.sleep(_poll_wait(cfg))
             continue
 
         ws.last_status = f"take(http): очередь {reserved}/{cfg.target_queue_size}, жду заявку"
@@ -993,7 +1132,7 @@ async def _poll_loop(
             None,
         )
         if candidate is None:
-            await asyncio.sleep(_sleep_ms(cfg.take_poll_min_ms, cfg.take_poll_max_ms))
+            await asyncio.sleep(_poll_wait(cfg))
             continue
 
         inflight.add(candidate["id"])
@@ -1061,7 +1200,13 @@ async def take_loop(
     py_overhead_ms (клиент), submit_rtt_ms (POST по сети), плюс отдельная запись
     take_result (confirmed — взяли или упустили).
     """
-    pollers = max(1, cfg.take_parallel_pollers)
+    configured_pollers = max(1, cfg.take_parallel_pollers)
+    pollers = _effective_pollers(cfg)
+    if pollers != configured_pollers:
+        logger.info(
+            "[%s] предиктив включён: воронок опроса %d → %d",
+            account.name, configured_pollers, pollers,
+        )
     await notify(
         f"⚡ HTTP-режим взятия запущен (без браузера). Цель: {cfg.target_queue_size} заявок, "
         f"воронок опроса: {pollers}."

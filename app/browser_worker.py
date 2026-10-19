@@ -666,10 +666,32 @@ async def ensure_logged_in(
         return False
 
     # Финальная страховка: ушли с /signin, но точно ли открылся кабинет, а не капча?
-    try:
-        html = await page.content()
-    except Exception:
-        html = ""
+    async def _page_html() -> str:
+        try:
+            return await page.content()
+        except Exception:
+            return ""
+
+    html = await _page_html()
+    # После входа сайт нередко отдаёт Cloudflare-проверку «Один момент…» — это НЕ
+    # провал авторизации: сессия уже создана, нужно лишь переждать проверку (и
+    # нажать Turnstile), затем перепроверить страницу. Без этого успешный вход
+    # помечался как after_login_unexpected (дамп с challenge-разметкой «Один
+    # момент…»), сессия не сохранялась и горячий цикл так и не запускался.
+    if _is_challenge_page(html):
+        await _wait_challenge_passed(page, cfg, notify, login_timeout)
+        if _on_signin(page):
+            await _send_debug_dump(
+                page,
+                cfg,
+                notify,
+                notify_file,
+                "after_login",
+                "❌ После Cloudflare-проверки сайт снова на странице входа — "
+                "авторизация не установлена. Присылаю HTML и скриншот.",
+            )
+            return False
+        html = await _page_html()
     if not _looks_like_cabinet(html) and not _looks_like_login_form(html):
         await _send_debug_dump(
             page,

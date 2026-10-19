@@ -7,6 +7,7 @@ import asyncio
 import json
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -23,15 +24,20 @@ from app.http_worker import (
     BlockedError,
     Metrics,
     PayoutClient,
+    TAKE_DUMP_BODY_CHARS,
     TAKE_REPLY_GONE,
     TAKE_REPLY_STILL_AVAILABLE,
     TAKE_REPLY_TAKEN,
     TAKE_REPLY_UNKNOWN,
     _classify,
     _classify_take_response,
+    _do_take,
     _dump_take_request,
+    _effective_pollers,
     _fire_predicted_window,
     _observe_queue,
+    _poll_loop,
+    _poll_wait,
     _recover_from_block,
     _reset_stored_session,
     _safe_text,
@@ -232,9 +238,16 @@ class ClassifyTakeResponseTest(unittest.TestCase):
             _classify_take_response(html, "6452828", cfg), TAKE_REPLY_STILL_AVAILABLE
         )
 
-    def test_unknown_when_id_absent(self):
+    def test_gone_when_our_row_absent_from_queue_page(self):
+        # Страница очереди есть, но НАШЕЙ строки нет → заявки больше нет (взяли/нет).
         cfg = self._cfg()
         html = _page_html(_row_html("9999999", "Ждет провайдера"))
+        self.assertEqual(_classify_take_response(html, "6452828", cfg), TAKE_REPLY_GONE)
+
+    def test_unknown_when_page_is_not_queue(self):
+        # Ответ вообще не похож на страницу очереди (например, дашборд).
+        cfg = self._cfg()
+        html = "<html><body><div class='user-account-page'>личный кабинет</div></body></html>"
         self.assertEqual(_classify_take_response(html, "6452828", cfg), TAKE_REPLY_UNKNOWN)
 
     def test_only_matches_requested_id(self):
@@ -255,7 +268,7 @@ class DumpTakeRequestTest(unittest.TestCase):
     """Дамп POST-запроса должен содержать и ТЕЛО ответа — чтобы вручную видеть
     разницу между «взяли» и «такой заявки нет»."""
 
-    def _dump(self, body: str, order_id: str = "6452828", server_reply=None):
+    def _dump(self, body: str, order_id: str = "6452828", server_reply=None, predicted=False):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_config(log_path=str(Path(tmp) / "actions.log"))
             response = httpx.Response(
@@ -270,6 +283,7 @@ class DumpTakeRequestTest(unittest.TestCase):
                 {"csrf_token": "tok", "act": "take_payout", "payout_id": order_id, "access_key": ""},
                 response,
                 server_reply,
+                predicted,
             )
             return json.loads(fp.read_text(encoding="utf-8")), fp.name
 
@@ -283,8 +297,8 @@ class DumpTakeRequestTest(unittest.TestCase):
         self.assertEqual(payload["response"]["server_reply"], TAKE_REPLY_TAKEN)
 
     def test_truncates_long_body(self):
-        payload, _ = self._dump("X" * 10000)
-        self.assertEqual(len(payload["response"]["text_head"]), 4000)
+        payload, _ = self._dump("X" * (TAKE_DUMP_BODY_CHARS + 5000))
+        self.assertEqual(len(payload["response"]["text_head"]), TAKE_DUMP_BODY_CHARS)
 
     def test_handles_non_text_response(self):
         # Тело, которое нельзя декодировать как текст, не должно ронять дамп.
@@ -316,6 +330,152 @@ class DumpTakeRequestTest(unittest.TestCase):
             content = "привет".encode("utf-8")
 
         self.assertEqual(_safe_text(Boom()), "привет")
+
+    def test_predicted_dump_has_suffix_and_flag(self):
+        payload, name = self._dump("<html>x</html>", predicted=True)
+        self.assertTrue(name.endswith("_pred.json"), name)
+        self.assertTrue(payload["predicted"])
+
+    def test_normal_dump_has_no_predicted_flag(self):
+        payload, name = self._dump("<html>x</html>", predicted=False)
+        self.assertFalse(name.endswith("_pred.json"))
+        self.assertFalse(payload["predicted"])
+
+
+class PredictedTakeMetricsTest(unittest.TestCase):
+    """Предсказательная отправка должна быть видна в metrics.jsonl (флаг predicted)."""
+
+    def test_take_metric_marks_predicted(self):
+        ws = WorkerState(index=1, name="К")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(metrics_path=str(Path(tmp) / "m.jsonl"))
+            metrics = Metrics(cfg)
+            client = mock.Mock()
+
+            async def take_payout(order_id, csrf_token, access_key=""):
+                return httpx.Response(
+                    200, request=httpx.Request("POST", cfg.queue_url), text="<html></html>"
+                )
+
+            async def fetch_demands():
+                return _page_html()  # пустая таблица → не подтвердится
+
+            client.take_payout = take_payout
+            client.fetch_demands = fetch_demands
+
+            async def notify(_text):
+                pass
+
+            row = {"id": "6467168", "csrf_token": "tok", "access_key": ""}
+            confirmed = asyncio.run(
+                _do_take(
+                    client, cfg, cfg.accounts[0], ws, notify, metrics, row, {},
+                    time.perf_counter(), set(), predicted=True,
+                )
+            )
+            self.assertFalse(confirmed)
+            lines = [
+                json.loads(line)
+                for line in Path(cfg.metrics_path).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            take = next(line for line in lines if line.get("event") == "take")
+            self.assertTrue(take["predicted"])
+            result = next(line for line in lines if line.get("event") == "take_result")
+            self.assertTrue(result["predicted"])
+
+
+class TakeRetryTest(unittest.TestCase):
+    """Повтор POST take_payout при НЕОДНОЗНАЧНОМ ответе сервера.
+
+    Если ответ «заявка ещё в очереди» (still_available) или не распознан (unknown)
+    и взятие не подтвердилось — делаем ограниченное число повторов. taken/gone не
+    повторяем, предсказанные id не повторяем (иначе POST-шторм).
+    """
+
+    def _run(self, *, post_html, demands_html, predicted=False,
+             retry_count=2, retry_delay_ms=0):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(
+                take_retry_count=retry_count,
+                take_retry_delay_ms=retry_delay_ms,
+                metrics_path=str(Path(tmp) / "m.jsonl"),
+                debug_capture_attempts=False,
+            )
+            ws = WorkerState(index=1, name="К")
+            metrics = Metrics(cfg)
+            posts = []
+
+            async def take_payout(order_id, csrf_token, access_key=""):
+                posts.append(order_id)
+                return httpx.Response(
+                    200, request=httpx.Request("POST", cfg.queue_url), text=post_html
+                )
+
+            async def fetch_demands():
+                return demands_html
+
+            client = mock.Mock()
+            client.take_payout = take_payout
+            client.fetch_demands = fetch_demands
+
+            async def notify(_text):
+                pass
+
+            row = {"id": "7001", "csrf_token": "tok", "access_key": ""}
+            confirmed = asyncio.run(
+                _do_take(
+                    client, cfg, cfg.accounts[0], ws, notify, metrics, row, {},
+                    time.perf_counter(), set(), predicted=predicted,
+                )
+            )
+            lines = [
+                json.loads(line)
+                for line in Path(cfg.metrics_path).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        return confirmed, posts, lines
+
+    def test_retries_on_still_available_until_limit(self):
+        still = _page_html(_row_html("7001", "Ждет провайдера"))
+        confirmed, posts, lines = self._run(
+            post_html=still, demands_html=_page_html(), retry_count=2
+        )
+        self.assertFalse(confirmed)
+        self.assertEqual(posts, ["7001", "7001", "7001"])   # 1 попытка + 2 повтора
+        takes = [r for r in lines if r.get("event") == "take"]
+        self.assertEqual([r["attempt"] for r in takes], [1, 2, 3])
+
+    def test_no_retry_when_order_gone(self):
+        gone = _page_html()                                  # нашей строки нет
+        confirmed, posts, _ = self._run(
+            post_html=gone, demands_html=_page_html(), retry_count=2
+        )
+        self.assertFalse(confirmed)
+        self.assertEqual(posts, ["7001"])                   # «уже забрали» — не повторяем
+
+    def test_no_retry_for_predicted(self):
+        still = _page_html(_row_html("7001", "Ждет провайдера"))
+        _, posts, _ = self._run(
+            post_html=still, demands_html=_page_html(), predicted=True, retry_count=2
+        )
+        self.assertEqual(posts, ["7001"])                   # предсказанные не повторяем
+
+    def test_no_retry_when_confirmed(self):
+        still = _page_html(_row_html("7001", "Ждет провайдера"))
+        demands = _page_html(_row_html("7001", "В работе у провайдера", with_form=False))
+        confirmed, posts, _ = self._run(
+            post_html=still, demands_html=demands, retry_count=2
+        )
+        self.assertTrue(confirmed)
+        self.assertEqual(posts, ["7001"])                   # взяли с первой попытки
+
+    def test_retry_disabled_by_zero(self):
+        still = _page_html(_row_html("7001", "Ждет провайдера"))
+        _, posts, _ = self._run(
+            post_html=still, demands_html=_page_html(), retry_count=0
+        )
+        self.assertEqual(posts, ["7001"])                   # TAKE_RETRY_COUNT=0 — без повторов
 
 
 class ResetStoredSessionTest(unittest.TestCase):
@@ -402,6 +562,18 @@ class PredictiveTakeTest(unittest.TestCase):
         self.assertEqual(ws.last_order_id, 6442137)
         self.assertEqual(ws.last_csrf_token, "tok")
 
+    def test_observe_queue_resets_predictive_pool(self):
+        """Поймав реальную заявку, отсчёт пула сбрасывается от неё — а не от
+        «убежавшего» вперёд предсказанного курсора."""
+        ws = WorkerState(index=1, name="К")
+        ws.observed_anchor = 6450000
+        ws.last_order_id = 6450500            # курсор убежал вперёд
+        ws.predictive_sent = {"6450501", "6450502"}
+        _observe_queue(ws, [{"id": "6450020", "csrf_token": "tok"}])
+        self.assertEqual(ws.observed_anchor, 6450020)
+        self.assertEqual(ws.last_order_id, 6450020)  # пул сброшен на реальный id
+        self.assertEqual(ws.predictive_sent, set())
+
     def test_fire_window_advances_cursor(self):
         ws = WorkerState(index=1, name="К")
         ws.last_order_id = 6442137
@@ -438,6 +610,43 @@ class PredictiveTakeTest(unittest.TestCase):
                 await asyncio.gather(*tasks)
         asyncio.run(run())
         self.assertEqual([c[0] for c in calls], ["6442139", "6442140"])
+
+    def test_predict_loop_notifies_once_per_anchor(self):
+        """Уведомление о превентивных POST шлётся ОДИН раз на якорь, а не каждые
+        PREDICTIVE_NOTIFY_MIN_S с неизменным текстом. Была жалоба, что сообщение
+        «🔮 Превентивно: N POST take_payout (окно от #…)» дублировалось в Telegram:
+        текст строился из ws.observed_anchor, который не меняется, пока нет новой
+        реальной заявки."""
+        ws = WorkerState(index=1, name="К")
+        ws.running = True
+        ws.mode = "take"
+        ws.last_order_id = 6442137
+        ws.observed_anchor = 6442137       # якорь не меняется → сообщение одно
+        ws.last_csrf_token = "tok"
+        cfg = self._cfg(predictive_take_gap_ms=0, predictive_take_lookahead=0, debug=True)
+        account = cfg.accounts[0]
+        calls = []
+        messages = []
+
+        async def notify(text):
+            messages.append(text)
+
+        def stop_after_windows(_row):
+            if len(calls) >= 9:            # три окна по 3 — останавливаем фон
+                ws.running = False
+            return False
+
+        async def run():
+            # Троттлинг отключаем (он и так не даёт спамить быстрее 3 с) — проверяем
+            # именно дедуп по якорю: без него было бы по сообщению на КАЖДОЕ окно.
+            with mock.patch("app.http_worker.PREDICTIVE_NOTIFY_MIN_S", 0.0), \
+                    mock.patch("app.http_worker._do_take",
+                               self._fake_do_take(calls, on_call=stop_after_windows)):
+                await predict_loop(None, cfg, account, ws, notify, None, set(), set())
+        asyncio.run(run())
+        self.assertGreaterEqual(len(calls), 9, calls)
+        self.assertEqual(len(messages), 1, messages)
+        self.assertIn("окно #6442138…", messages[0])
 
     def test_failed_window_advances_and_fires_next(self):
         """Если окно целиком неудачное — берём наибольший id окна и шлём следующее."""
@@ -562,13 +771,12 @@ class PredictiveTakeTest(unittest.TestCase):
         self.assertEqual(ws.predicted_inflight, set())
 
     def test_predict_loop_does_not_run_past_lookahead(self):
-        """Защита от «убегания вперёд»: пока реальность (observed_anchor) не
-        двигается, предсказатель не отправляет id дальше, чем на
-        predictive_take_lookahead от реально увиденной заявки.
+        """Курсор не уходит дальше `lookahead` от якоря, а ДОЙДЯ до предела
+        предсказатель ПОВТОРНО обстреливает тот же диапазон (retry), а не встаёт
+        ждать. Иначе заявку, чей id уже пробовали (когда её ещё не было), мы бы не
+        поймали — это и было «пропускаем все заявки».
 
-        count=3, lookahead=6 -> ровно 3 окна (9 отправок), после чего цикл
-        упирается в лимит и НЕ шлёт больше (в отличие от lookahead=0, где он
-        продолжил бы шагать без остановки).
+        count=3, lookahead=6 -> проход 1..9, затем снова с 1 (повторы).
         """
         ws = WorkerState(index=1, name="К")
         ws.running = True
@@ -580,30 +788,39 @@ class PredictiveTakeTest(unittest.TestCase):
                         predictive_take_lookahead=6)
         calls = []
 
+        async def fake(client, cfg, account, ws, notify, metrics, row, timing,
+                       t_recv, inflight, predicted=False):
+            # Как реальный _do_take: по завершении освобождаем id, иначе повторный
+            # обстрел «залипнет» на уже отправленных id.
+            calls.append((row["id"], predicted))
+            inflight.discard(row["id"])
+            return False
+
         async def run():
-            with mock.patch("app.http_worker._do_take", self._fake_do_take(calls)):
+            with mock.patch("app.http_worker._do_take", fake):
                 task = asyncio.create_task(
                     predict_loop(None, cfg, cfg.accounts[0], ws, None, None, set(), set())
                 )
-                await asyncio.sleep(0.2)  # время отработать окна и упереться в лимит
+                await asyncio.sleep(0.3)  # время на проход фронта и повтор
                 ws.running = False
                 await asyncio.gather(task, return_exceptions=True)
         asyncio.run(run())
 
-        self.assertEqual(
-            [c[0] for c in calls],
-            ["6450001", "6450002", "6450003",
-             "6450004", "6450005", "6450006",
-             "6450007", "6450008", "6450009"],
-        )
-        # курсор не убежал дальше лимита lookahead
-        self.assertEqual(ws.last_order_id, 6450009)
+        ids = [int(c[0]) for c in calls]
+        self.assertGreaterEqual(len(ids), 12, ids)
+        # проход по окнам вперёд, строго по порядку, до предела lookahead
+        self.assertEqual(ids[:9], [6450001, 6450002, 6450003,
+                                   6450004, 6450005, 6450006,
+                                   6450007, 6450008, 6450009])
+        # на пределе — ПОВТОР с того же места, а не новые большие id
+        self.assertEqual(ids[9:12], [6450001, 6450002, 6450003])
+        self.assertLessEqual(max(ids), 6450009)
         self.assertEqual(ws.observed_anchor, 6450000)
 
     def test_predict_loop_resumes_after_new_observation(self):
-        """Как только реальность догнала курсор (новая заявка сдвинула
-        observed_anchor), предсказатель снова продолжает шагать — мы остаёмся
-        в актуальном цикле, а не «залипаем» позади или впереди."""
+        """(1) При статичной реальности предсказатель НЕ встаёт — он повторно
+        обстреливает фронт. (2) Когда реальность уходит вперёд (observed_anchor
+        растёт), курсор догоняет её и обстрел идёт от нового id."""
         ws = WorkerState(index=1, name="К")
         ws.running = True
         ws.mode = "take"
@@ -620,24 +837,131 @@ class PredictiveTakeTest(unittest.TestCase):
                 await asyncio.sleep(0.01)
                 waited += 0.01
 
+        async def fake(client, cfg, account, ws, notify, metrics, row, timing,
+                       t_recv, inflight, predicted=False):
+            # Как реальный _do_take: по завершении освобождаем id для повторного обстрела.
+            calls.append((row["id"], predicted))
+            inflight.discard(row["id"])
+            return False
+
         async def run():
-            with mock.patch("app.http_worker._do_take", self._fake_do_take(calls)):
+            with mock.patch("app.http_worker._do_take", fake):
                 task = asyncio.create_task(
                     predict_loop(None, cfg, cfg.accounts[0], ws, None, None, set(), set())
                 )
-                # фаза 1: предсказатель отрабатывает до лимита lookahead (2 окна = 6)
+                # фаза 1: фронт обстрелян
                 await wait_for(lambda: len(calls) >= 6)
-                n_at_limit = len(calls)
-                # фаза 2: реальность статична — новых отправок быть не должно
-                await asyncio.sleep(0.05)
-                self.assertEqual(len(calls), n_at_limit)
-                # фаза 3: реальность догнала курсор — предсказатель возобновляет
-                ws.observed_anchor = ws.last_order_id
-                await wait_for(lambda: len(calls) > n_at_limit)
-                self.assertGreater(len(calls), n_at_limit)
+                n1 = len(calls)
+                # фаза 2: реальность статична, но предсказатель продолжает (retry)
+                await wait_for(lambda: len(calls) > n1)
+                self.assertGreater(len(calls), n1)
+                # фаза 3: реальность ушла вперёд — курсор догоняет её и обстрел от нового id
+                ws.observed_anchor = 6450500
+                await wait_for(lambda: any(int(c[0]) > 6450500 for c in calls))
+                self.assertTrue(any(int(c[0]) > 6450500 for c in calls))
                 ws.running = False
                 await asyncio.gather(task, return_exceptions=True)
         asyncio.run(run())
+
+
+class PredictivePollIntervalTest(unittest.TestCase):
+    """При включённом предиктиве опрос очереди РЕЖЕ: заявки ловит predict_loop
+    спекулятивными POST, а частые GET лишь ловят бан Cloudflare."""
+
+    def test_poll_wait_slow_when_predictive_on(self):
+        cfg = make_config(predictive_take=True, predictive_take_poll_ms=1000,
+                          take_poll_min_ms=200, take_poll_max_ms=300)
+        for _ in range(30):
+            self.assertGreaterEqual(_poll_wait(cfg), 1.0)
+            self.assertLessEqual(_poll_wait(cfg), 1.5)
+
+    def test_poll_wait_normal_when_predictive_off(self):
+        cfg = make_config(predictive_take=False, predictive_take_poll_ms=1000,
+                          take_poll_min_ms=200, take_poll_max_ms=300)
+        for _ in range(30):
+            self.assertGreaterEqual(_poll_wait(cfg), 0.2)
+            self.assertLessEqual(_poll_wait(cfg), 0.3)
+
+    def test_poll_wait_zero_keeps_normal_even_with_predictive(self):
+        cfg = make_config(predictive_take=True, predictive_take_poll_ms=0,
+                          take_poll_min_ms=200, take_poll_max_ms=300)
+        for _ in range(30):
+            self.assertGreaterEqual(_poll_wait(cfg), 0.2)
+            self.assertLessEqual(_poll_wait(cfg), 0.3)
+
+    def test_default_is_active_hot_poll_even_with_predictive(self):
+        """По умолчанию (PREDICTIVE_TAKE_POLL_MS не задан = 0) горячий GET-цикл
+        АКТИВЕН и с предиктивом: пауза из TAKE_POLL_MIN/MAX_MS и все воронки.
+        Предиктив только добавляет POST, а не заменяет опрос."""
+        cfg = make_config(predictive_take=True,
+                          take_poll_min_ms=200, take_poll_max_ms=300,
+                          take_parallel_pollers=3)
+        self.assertEqual(cfg.predictive_take_poll_ms, 0)
+        for _ in range(20):
+            self.assertGreaterEqual(_poll_wait(cfg), 0.2)
+            self.assertLessEqual(_poll_wait(cfg), 0.3)
+        self.assertEqual(_effective_pollers(cfg), 3)
+
+    def test_effective_pollers_kept_when_interval_faster_than_normal(self):
+        """PREDICTIVE_TAKE_POLL_MS меньше обычного интервала (напр. 1 мс =
+        «максимально быстро») — воронки НЕ режем: иначе «ускорение» парадоксально
+        уменьшало бы их число."""
+        cfg = make_config(predictive_take=True, predictive_take_poll_ms=1,
+                          take_poll_min_ms=150, take_poll_max_ms=200,
+                          take_parallel_pollers=3)
+        self.assertLess(_poll_wait(cfg), 0.01)   # ~1 мс
+        self.assertEqual(_effective_pollers(cfg), 3)
+
+    def test_effective_pollers_capped_to_one_with_predictive(self):
+        """С предиктивом лишние воронки опроса — только GET-нагрузка: оставляем 1."""
+        cfg = make_config(predictive_take=True, predictive_take_poll_ms=1000,
+                          take_parallel_pollers=3)
+        self.assertEqual(_effective_pollers(cfg), 1)
+
+    def test_effective_pollers_kept_without_predictive(self):
+        cfg = make_config(predictive_take=False, take_parallel_pollers=3)
+        self.assertEqual(_effective_pollers(cfg), 3)
+
+    def test_effective_pollers_kept_when_poll_ms_zero(self):
+        cfg = make_config(predictive_take=True, predictive_take_poll_ms=0,
+                          take_parallel_pollers=3)
+        self.assertEqual(_effective_pollers(cfg), 3)
+
+    def test_poll_loop_sleeps_poll_wait(self):
+        """_poll_loop реально берёт паузу из _poll_wait (а не жёстко TAKE_POLL_*)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(
+                predictive_take=True, predictive_take_poll_ms=1000,
+                metrics_path=str(Path(tmp) / "m.jsonl"),
+            )
+            ws = WorkerState(index=1, name="К")
+            ws.running = True
+            ws.mode = "take"
+            ws.last_csrf_token = "tok"
+
+            class FakeClient:
+                async def fetch_queue(self):
+                    return _page_html()      # пустая таблица → кандидатов нет
+
+            async def notify(_text):
+                pass
+
+            sleeps = []
+
+            async def fake_sleep(seconds):
+                sleeps.append(seconds)
+                if len(sleeps) >= 3:
+                    ws.running = False
+
+            async def run():
+                with mock.patch("app.http_worker.asyncio.sleep", fake_sleep):
+                    await _poll_loop(
+                        FakeClient(), cfg, cfg.accounts[0], ws, notify, notify,
+                        Metrics(cfg), set(), set(),
+                    )
+            asyncio.run(run())
+            self.assertTrue(sleeps, sleeps)
+            self.assertGreaterEqual(sleeps[0], 1.0)   # предиктив → редкий опрос
 
 
 class LoadCookiesTest(unittest.TestCase):

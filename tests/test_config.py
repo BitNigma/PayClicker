@@ -176,6 +176,15 @@ class PredictiveTakeConfigTest(unittest.TestCase):
             self.assertEqual(cfg.predictive_take_gap_ms, 50)
             self.assertEqual(cfg.predictive_take_lookahead, 0)
 
+    def test_dumps_disabled_by_default(self):
+        with patch.dict(os.environ, self.BASE_ENV, clear=True):
+            self.assertFalse(load_config().predictive_take_dumps)
+
+    def test_dumps_enabled(self):
+        env = dict(self.BASE_ENV, PREDICTIVE_TAKE_DUMPS="true")
+        with patch.dict(os.environ, env, clear=True):
+            self.assertTrue(load_config().predictive_take_dumps)
+
 
 class DebugConfigTest(unittest.TestCase):
     """DEBUG: отладочные сообщения в Telegram (по умолчанию включены)."""
