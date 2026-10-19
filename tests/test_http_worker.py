@@ -537,6 +537,71 @@ class RecoverFromBlockTest(unittest.TestCase):
         self.assertTrue(any("не помогла" in m for m in sent))
 
 
+class ProxySupportTest(unittest.TestCase):
+    """Прокси: список из env/файла, ротация IP при блокировке, маскирование."""
+
+    def test_load_proxies_from_env_and_file_dedup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pf = Path(tmp) / "proxies.txt"
+            pf.write_text(
+                "# комментарий\nhttp://p2:8080\nhttp://p1:8080\nhttp://p2:8080\n",
+                encoding="utf-8",
+            )
+            cfg = make_config(
+                proxy_urls=["http://p1:8080", "http://p3:8080"],
+                proxy_file=str(pf),
+            )
+            self.assertEqual(
+                load_proxies(cfg),
+                ["http://p1:8080", "http://p3:8080", "http://p2:8080"],
+            )
+
+    def test_proxy_pool_rotates_and_reloads_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pf = Path(tmp) / "proxies.txt"
+            pf.write_text("http://a:1\nhttp://b:2\n", encoding="utf-8")
+            cfg = make_config(proxy_urls=[], proxy_file=str(pf))
+            pool = ProxyPool(cfg)
+            self.assertEqual(pool.count, 2)
+            self.assertEqual(pool.current(), "http://a:1")
+            # файл дополнили на лету — rotate перечитывает его
+            pf.write_text("http://a:1\nhttp://b:2\nhttp://c:3\n", encoding="utf-8")
+            self.assertEqual(pool.rotate(), "http://b:2")
+            self.assertEqual(pool.rotate(), "http://c:3")
+            self.assertEqual(pool.rotate(), "http://a:1")
+
+    def test_mask_proxy_hides_credentials(self):
+        self.assertEqual(mask_proxy("http://user:pass@1.2.3.4:8080"), "http://1.2.3.4:8080")
+        self.assertEqual(mask_proxy(None), "direct")
+
+    def test_payout_client_accepts_proxy(self):
+        cfg = make_config()
+        client = PayoutClient(cfg, {}, proxy="http://127.0.0.1:9")
+        try:
+            self.assertEqual(client.proxy, "http://127.0.0.1:9")
+        finally:
+            asyncio.run(client.aclose())
+
+    def test_recover_from_block_rotates_proxy_before_reauth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pf = Path(tmp) / "proxies.txt"
+            pf.write_text("http://a:1\nhttp://b:2\n", encoding="utf-8")
+            cfg = make_config(proxy_file=str(pf), proxy_rotate_on_block=True)
+            account = cfg.accounts[0]
+            ws = WorkerState(index=1, name="К")
+            sent = []
+
+            async def notify(text):
+                sent.append(text)
+
+            pool = ProxyPool(cfg)
+            ok = asyncio.run(_recover_from_block(cfg, account, ws, notify, notify, pool))
+            self.assertTrue(ok)
+            self.assertEqual(ws.proxy_rotations, 1)
+            self.assertEqual(ws.reauth_attempts, 0)   # cookies НЕ сбрасывали
+            self.assertTrue(any("меняю прокси" in m for m in sent))
+
+
 class PredictiveTakeTest(unittest.TestCase):
     """Превентивное взятие: шагаем вперёд окнами по count id от пойманного id."""
 

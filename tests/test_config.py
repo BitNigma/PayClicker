@@ -229,5 +229,37 @@ class TakeMarkersConfigTest(unittest.TestCase):
             self.assertEqual(cfg.take_gone_markers, ("заявка не найдена", "уже взята"))
 
 
+class ProxyConfigTest(unittest.TestCase):
+    """PROXY_URLS / PROXY_FILE / PROXY_ROTATE_ON_BLOCK."""
+
+    BASE_ENV = TakeMarkersConfigTest.BASE_ENV
+
+    def test_empty_by_default(self):
+        with patch.dict(os.environ, self.BASE_ENV, clear=True):
+            cfg = load_config()
+            self.assertEqual(cfg.proxy_urls, [])
+            self.assertIsNone(cfg.proxy_file)
+            self.assertTrue(cfg.proxy_rotate_on_block)
+
+    def test_proxy_urls_split(self):
+        env = dict(self.BASE_ENV, PROXY_URLS="http://a:1, http://b:2;http://c:3")
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(
+                load_config().proxy_urls,
+                ["http://a:1", "http://b:2", "http://c:3"],
+            )
+
+    def test_proxy_file_and_rotate_flag(self):
+        env = dict(
+            self.BASE_ENV,
+            PROXY_FILE="/data/proxies.txt",
+            PROXY_ROTATE_ON_BLOCK="false",
+        )
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+            self.assertEqual(cfg.proxy_file, "/data/proxies.txt")
+            self.assertFalse(cfg.proxy_rotate_on_block)
+
+
 if __name__ == "__main__":
     unittest.main()

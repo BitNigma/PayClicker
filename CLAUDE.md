@@ -167,6 +167,19 @@ ID заявок на площадке идут по порядку, поэтом
   НЕ считается неудачей, сессия сохраняется. Если после проверки снова `/signin` — это
   честный провал (`after_login`).
 
+## Прокси / смена IP
+
+Если сайт банит по IP (403/Cloudflare), задаются прокси: `PROXY_URLS` (через запятую)
+и/или `PROXY_FILE` (по одному на строку; файл перечитывается на лету — можно менять
+без перезапуска). Прокси используется и в HTTP-цикле (`PayoutClient(cfg, cookies,
+proxy=...)`), и в браузерной авторизации (`_build_context(..., proxy=...)`).
+
+При `BlockedError` функция `_recover_from_block` **сначала меняет прокси**
+(`ProxyPool.rotate`, счётчик `ws.proxy_rotations`), **не трогая cookies**; сброс cookies
+и реавторизация — только когда прокси нет или все перебраны. `PROXY_ROTATE_ON_BLOCK=false`
+отключает смену IP (сразу сброс cookies). Логин/пароль прокси в логах/Telegram
+маскируются (`mask_proxy` → `http://host:port`).
+
 ## Мультиаккаунт
 
 - Кабинет #1: `SITE_LOGIN`/`SITE_PASSWORD`/`SITE_NAME`, сессия `STORAGE_STATE_PATH` (`./data/auth.json`).
