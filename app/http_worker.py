@@ -29,6 +29,7 @@ import random
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -329,12 +330,77 @@ class Metrics:
             logger.exception("Не удалось записать метрику в %s", self.path)
 
 
+def mask_proxy(url: str | None) -> str:
+    """Безопасное представление прокси для логов/Telegram (без логина/пароля)."""
+    if not url:
+        return "direct"
+    try:
+        p = urlsplit(url)
+        host = p.hostname or "?"
+        port = f":{p.port}" if p.port else ""
+        return f"{p.scheme or 'http'}://{host}{port}"
+    except Exception:
+        return "proxy"
+
+
+def load_proxies(cfg: Config) -> list[str]:
+    """Прокси: `PROXY_URLS` + строки из `PROXY_FILE` (по одной; `#` — комментарий).
+
+    Файл перечитывается при каждом вызове, поэтому список можно менять на лету —
+    дописать/убрать прокси без перезапуска бота. Дубликаты и пустые строки убираются.
+    """
+    urls = list(getattr(cfg, "proxy_urls", None) or [])
+    path = getattr(cfg, "proxy_file", None)
+    if path:
+        try:
+            for line in Path(path).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    urls.append(line)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.exception("Не удалось прочитать прокси-файл %s", path)
+    seen = set()
+    out = []
+    for url in urls:
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+class ProxyPool:
+    """Круговой список прокси с перечитыванием файла — для смены IP на лету."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._urls = load_proxies(cfg)
+        self._idx = 0
+
+    @property
+    def count(self) -> int:
+        return len(self._urls)
+
+    def current(self) -> str | None:
+        return self._urls[self._idx] if self._urls else None
+
+    def rotate(self) -> str | None:
+        """Перечитывает список и переключается на следующий прокси."""
+        self._urls = load_proxies(self.cfg) or self._urls
+        if not self._urls:
+            return None
+        self._idx = (self._idx + 1) % len(self._urls)
+        return self._urls[self._idx]
+
+
 class PayoutClient:
     """Async HTTP-клиент сайта. Держит одно keep-alive соединение и cookies сессии."""
 
-    def __init__(self, cfg: Config, cookies: dict):
+    def __init__(self, cfg: Config, cookies: dict, proxy: str | None = None):
         self.cfg = cfg
-        self._client = httpx.AsyncClient(
+        self.proxy = proxy
+        kwargs = dict(
             base_url=f"https://{SITE_HOST}",
             cookies=cookies,
             headers=_default_headers(cfg),
@@ -342,6 +408,9 @@ class PayoutClient:
             follow_redirects=True,
             http2=False,
         )
+        if proxy:
+            kwargs["proxy"] = proxy
+        self._client = httpx.AsyncClient(**kwargs)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -451,7 +520,8 @@ async def _session_ok(client: PayoutClient) -> bool:
 
 
 async def ensure_session(
-    cfg: Config, account, ws: WorkerState, notify, notify_file=None, force_reauth: bool = False
+    cfg: Config, account, ws: WorkerState, notify, notify_file=None,
+    force_reauth: bool = False, proxy: str | None = None,
 ) -> dict | None:
     """Возвращает рабочие cookies кабинета. Если сохранённые не годятся — разово
     поднимает браузер, чтобы обновить auth.json кабинета (вне горячего цикла).
@@ -464,7 +534,7 @@ async def ensure_session(
     """
     cookies = {} if force_reauth else load_cookies(account)
     if cookies:
-        probe = PayoutClient(cfg, cookies)
+        probe = PayoutClient(cfg, cookies, proxy=proxy)
         try:
             if await _session_ok(probe):
                 return cookies
@@ -474,7 +544,7 @@ async def ensure_session(
     await notify("🔐 Cookies недействительны/сброшены — разовая браузерная авторизация (вне горячего цикла)...")
     from .browser_worker import login_via_browser  # локальный импорт: браузер нужен только тут
 
-    ok = await login_via_browser(cfg, account, ws, notify, notify_file)
+    ok = await login_via_browser(cfg, account, ws, notify, notify_file, proxy=proxy)
     if not ok:
         return None
     return load_cookies(account) or None
@@ -1294,13 +1364,19 @@ async def take_loop(
             await asyncio.gather(*take_tasks, return_exceptions=True)
 
 
-async def _run_hot_loop(cfg: Config, account, ws: WorkerState, notify, notify_file, metrics, cookies) -> None:
+async def _run_hot_loop(
+    cfg: Config, account, ws: WorkerState, notify, notify_file, metrics, cookies,
+    proxy: str | None = None,
+) -> None:
     """Один заход горячего цикла на готовых cookies. Возвращается, когда цикл сам
     завершился (ws.running=False внутри) — например, после блокировки/сбоя сессии."""
-    client = PayoutClient(cfg, cookies)
+    client = PayoutClient(cfg, cookies, proxy=proxy)
     ws.logged_in = True
     try:
-        await notify("🚀 HTTP-цикл запущен (браузер в горячем цикле не используется).")
+        ip_note = f" · прокси {mask_proxy(proxy)}" if proxy else " · без прокси"
+        await notify(
+            f"🚀 HTTP-цикл запущен (браузер в горячем цикле не используется){ip_note}."
+        )
         if ws.mode == "watch":
             await watch_loop(client, cfg, account, ws, notify, notify_file, metrics)
         else:
@@ -1310,19 +1386,40 @@ async def _run_hot_loop(cfg: Config, account, ws: WorkerState, notify, notify_fi
         ws.logged_in = False
 
 
-async def _recover_from_block(cfg: Config, account, ws: WorkerState, notify, notify_file) -> bool:
-    """Сброс cookies + повторная браузерная авторизация после блокировки (403/антибот).
+async def _recover_from_block(
+    cfg: Config, account, ws: WorkerState, notify, notify_file, pool: "ProxyPool | None" = None
+) -> bool:
+    """Восстановление после блокировки (403/антибот).
 
-    Удаляет сохранённую сессию кабинета (auth.json) и проходит авторизацию с нуля:
-    свежий cf_clearance обычно снимает блок. Число подряд неудачных переавторизаций
-    ограничено MAX_BLOCK_REAUTH, чтобы не зациклиться. Возвращает True, если удалось
-    получить рабочие cookies.
+    1) Если настроены прокси — сначала МЕНЯЕМ IP (прокси), НЕ трогая cookies: бан
+       Cloudflare обычно привязан к IP, и смена прокси часто возвращает доступ сразу
+       (быстрее и без риска потерять сессию).
+    2) Если прокси нет / все перебраны — как раньше: удаляем auth.json и проходим
+       авторизацию с нуля. Число реавторизаций ограничено MAX_BLOCK_REAUTH.
+    Возвращает True, если удалось восстановиться (сменить IP или получить cookies).
     """
+    # 1) Смена IP до сброса cookies.
+    if (
+        pool is not None
+        and getattr(cfg, "proxy_rotate_on_block", False)
+        and pool.count > 1
+        and ws.proxy_rotations < pool.count
+    ):
+        new = pool.rotate()
+        if new:
+            ws.proxy_rotations += 1
+            await notify(
+                f"🔁 Блокировка по IP — меняю прокси на {mask_proxy(new)} "
+                f"({ws.proxy_rotations}/{pool.count}), cookies оставляю."
+            )
+            return True
+
+    # 2) Сброс cookies + авторизация заново.
     if ws.reauth_attempts >= MAX_BLOCK_REAUTH:
         await notify(
             f"⛔ Сайт блокирует запросы, переавторизация не помогла "
             f"({ws.reauth_attempts}/{MAX_BLOCK_REAUTH}). Останавливаюсь — проверьте "
-            "кабинет вручную или вернитесь на WORKER_BACKEND=browser."
+            "кабинет вручную или добавьте прокси (PROXY_URLS/PROXY_FILE)."
         )
         return False
 
@@ -1334,7 +1431,10 @@ async def _recover_from_block(cfg: Config, account, ws: WorkerState, notify, not
         f"и прохожу авторизацию заново — попытка {ws.reauth_attempts}/{MAX_BLOCK_REAUTH}…"
     )
     try:
-        cookies = await ensure_session(cfg, account, ws, notify, notify_file, force_reauth=True)
+        cookies = await ensure_session(
+            cfg, account, ws, notify, notify_file, force_reauth=True,
+            proxy=pool.current() if pool is not None else None,
+        )
     except BlockedError as exc:
         await notify(f"⛔ Повторная авторизация тоже заблокирована: {exc}")
         return False
@@ -1351,6 +1451,10 @@ async def run_worker(cfg: Config, account, ws: WorkerState, notify, notify_file)
     Все уведомления помечаются именем кабинета, чтобы было видно, чья это заявка.
     """
     metrics = Metrics(cfg)
+    # Прокси-пул кабинета: при блокировке меняем IP (см. _recover_from_block).
+    pool = ProxyPool(cfg)
+    if pool.count:
+        logger.info("[%s] прокси в пуле: %d (старт: %s)", account.name, pool.count, mask_proxy(pool.current()))
 
     async def acct_notify(text: str):
         await notify(f"[{account.name}] {text}")
@@ -1364,17 +1468,19 @@ async def run_worker(cfg: Config, account, ws: WorkerState, notify, notify_file)
             continue
 
         try:
-            cookies = await ensure_session(cfg, account, ws, acct_notify, acct_notify_file)
+            cookies = await ensure_session(
+                cfg, account, ws, acct_notify, acct_notify_file, proxy=pool.current()
+            )
         except BlockedError as exc:
             await acct_notify(f"⛔ {exc}")
             cookies = None
             ws.needs_reauth = True
 
-        # Проверка сессии или горячий цикл упёрлись в блокировку: сбрасываем
-        # cookies кабинета и проходим авторизацию заново.
+        # Проверка сессии или горячий цикл упёрлись в блокировку: сначала пробуем
+        # сменить IP (прокси), и только потом — сброс cookies и реавторизацию.
         if ws.needs_reauth:
             ws.needs_reauth = False
-            if not await _recover_from_block(cfg, account, ws, acct_notify, acct_notify_file):
+            if not await _recover_from_block(cfg, account, ws, acct_notify, acct_notify_file, pool):
                 ws.running = False
             continue
 
@@ -1383,18 +1489,21 @@ async def run_worker(cfg: Config, account, ws: WorkerState, notify, notify_file)
             continue
 
         t_started = time.monotonic()
-        await _run_hot_loop(cfg, account, ws, acct_notify, acct_notify_file, metrics, cookies)
+        await _run_hot_loop(
+            cfg, account, ws, acct_notify, acct_notify_file, metrics, cookies,
+            proxy=pool.current(),
+        )
 
         # Если цикл реально проработал какое-то время, значит блок позади — только
-        # тогда обнуляем счётчик переавторизаций (иначе можно зациклиться на
-        # быстрых повторных блокировках).
+        # тогда обнуляем счётчики (иначе можно зациклиться на быстрых блокировках).
         if time.monotonic() - t_started > 30:
             ws.reauth_attempts = 0
+            ws.proxy_rotations = 0
 
-        # Горячий цикл мог остановиться из-за блокировки — переавторизуемся и продолжим.
+        # Горячий цикл мог остановиться из-за блокировки — восстанавливаемся и продолжим.
         if ws.needs_reauth:
             ws.needs_reauth = False
-            if not await _recover_from_block(cfg, account, ws, acct_notify, acct_notify_file):
+            if not await _recover_from_block(cfg, account, ws, acct_notify, acct_notify_file, pool):
                 ws.running = False
             continue
 

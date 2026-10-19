@@ -5,6 +5,7 @@ import os
 import random
 import time
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from playwright.async_api import async_playwright, Page, BrowserContext
 
@@ -458,16 +459,38 @@ def _login_lock() -> asyncio.Lock:
     return _LOGIN_LOCK
 
 
-async def _build_context(pw, cfg: Config, account) -> BrowserContext:
+def _playwright_proxy(url: str | None) -> dict | None:
+    """URL прокси → формат Playwright: {"server", "username", "password"}."""
+    if not url:
+        return None
+    p = urlsplit(url)
+    if not p.hostname:
+        return None
+    server = f"{p.scheme or 'http'}://{p.hostname}"
+    if p.port:
+        server += f":{p.port}"
+    out = {"server": server}
+    if p.username:
+        out["username"] = unquote(p.username)
+    if p.password:
+        out["password"] = unquote(p.password)
+    return out
+
+
+async def _build_context(pw, cfg: Config, account, proxy: str | None = None) -> BrowserContext:
     browser = await pw.chromium.launch(
         headless=cfg.headless,
         args=["--disable-blink-features=AutomationControlled"],
     )
     storage_path = Path(account.storage_state_path)
+    kwargs = {}
+    pw_proxy = _playwright_proxy(proxy)
+    if pw_proxy:
+        kwargs["proxy"] = pw_proxy
     if storage_path.exists():
-        context = await browser.new_context(storage_state=str(storage_path))
+        context = await browser.new_context(storage_state=str(storage_path), **kwargs)
     else:
-        context = await browser.new_context()
+        context = await browser.new_context(**kwargs)
     return browser, context
 
 
@@ -712,7 +735,7 @@ async def ensure_logged_in(
     return True
 
 
-async def login_via_browser(cfg: Config, account, ws, notify, notify_file=None) -> bool:
+async def login_via_browser(cfg: Config, account, ws, notify, notify_file=None, proxy: str | None = None) -> bool:
     """Разовая браузерная авторизация (в т.ч. 2FA) — нужна ТОЛЬКО чтобы получить
     и обновить cookies кабинета в его storage_state_path для HTTP-горячего цикла
     (http_worker). Сам горячий цикл браузер не использует.
@@ -725,13 +748,15 @@ async def login_via_browser(cfg: Config, account, ws, notify, notify_file=None) 
     if lock.locked():
         await notify("⏳ Другой кабинет сейчас авторизуется — жду своей очереди...")
     async with lock:
-        return await _login_via_browser_locked(cfg, account, ws, notify, notify_file)
+        return await _login_via_browser_locked(cfg, account, ws, notify, notify_file, proxy=proxy)
 
 
-async def _login_via_browser_locked(cfg: Config, account, ws, notify, notify_file=None) -> bool:
+async def _login_via_browser_locked(
+    cfg: Config, account, ws, notify, notify_file=None, proxy: str | None = None
+) -> bool:
     """Сама авторизация; вызывать только под _login_lock()."""
     async with async_playwright() as pw:
-        browser, context = await _build_context(pw, cfg, account)
+        browser, context = await _build_context(pw, cfg, account, proxy=proxy)
         try:
             page = await context.new_page()
             return await ensure_logged_in(page, context, cfg, account, ws, notify, notify_file)

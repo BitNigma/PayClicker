@@ -39,6 +39,9 @@ from app.http_worker import (
     _poll_loop,
     _poll_wait,
     _recover_from_block,
+    ProxyPool,
+    load_proxies,
+    mask_proxy,
     _reset_stored_session,
     _safe_text,
     in_work_ids,
@@ -508,7 +511,8 @@ class RecoverFromBlockTest(unittest.TestCase):
             async def notify(text):
                 sent.append(text)
 
-            async def fake_ensure(cfg, account, ws, notify, notify_file=None, force_reauth=False):
+            async def fake_ensure(cfg, account, ws, notify, notify_file=None,
+                                  force_reauth=False, proxy=None):
                 self.assertTrue(force_reauth)  # переавторизация идёт с нуля
                 return {"PHPSESSID": "x"}
 

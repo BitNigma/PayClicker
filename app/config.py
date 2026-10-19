@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -89,6 +89,17 @@ class Config:
     take_retry_count: int = 2
     # Пауза между повторными POST, мс.
     take_retry_delay_ms: int = 120
+
+    # --- Прокси (оперативная смена IP при бане) ---
+    # Прокси из env PROXY_URLS (через запятую/пробел) И/ИЛИ из файла PROXY_FILE
+    # (по одному на строку, `#` — комментарий). Файл перечитывается на лету, поэтому
+    # список можно менять без перезапуска бота. Форматы:
+    #   http://host:port, http://user:pass@host:port, socks5://user:pass@host:port
+    proxy_urls: list[str] = field(default_factory=list)
+    proxy_file: str | None = None
+    # При блокировке (403/антибот) сначала сменить прокси (IP), НЕ трогая cookies;
+    # сброс cookies и полная реавторизация — только если смена IP не помогла.
+    proxy_rotate_on_block: bool = True
 
     # Отладочные сообщения в Telegram: HTML/PNG-дампы страниц, подробные сводки
     # очереди. Включается DEBUG=true. При DEBUG=false бот шлёт только важное
@@ -190,6 +201,16 @@ def _split_markers(raw: str) -> tuple:
     return tuple(markers)
 
 
+def _split_list(raw: str) -> list[str]:
+    """Разбирает список из env (через запятую/точку с запятой/пробелы/переводы строк).
+
+    Используется для PROXY_URLS. Пустые элементы отбрасываются.
+    """
+    if not raw:
+        return []
+    return [p.strip() for p in re.split(r"[,;\s]+", raw) if p.strip()]
+
+
 
 def load_accounts(env) -> list[Account]:
     """Собирает список кабинетов из переменных окружения.
@@ -279,6 +300,10 @@ def load_config() -> Config:
         # Повтор POST при неоднозначном ответе (still_available / unknown).
         take_retry_count=max(0, int(env.get("TAKE_RETRY_COUNT", "2"))),
         take_retry_delay_ms=max(0, int(env.get("TAKE_RETRY_DELAY_MS", "120"))),
+        # Прокси: список из env и/или файл (файл перечитывается на лету).
+        proxy_urls=_split_list(env.get("PROXY_URLS", "")),
+        proxy_file=(env.get("PROXY_FILE") or None),
+        proxy_rotate_on_block=env.get("PROXY_ROTATE_ON_BLOCK", "true").lower() == "true",
         # Отладочные сообщения в Telegram (дампы, подробные сводки). DEBUG=false — тише.
         debug=env.get("DEBUG", "true").lower() == "true",
         # Маркеры в теле ответа на POST take_payout (каждое значение — через запятую).
