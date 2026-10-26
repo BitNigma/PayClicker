@@ -58,7 +58,7 @@
 | Постоянные 403 / бан по IP | задайте `PROXY_URLS`/`PROXY_FILE` (+`PROXY_ROTATE_ON_BLOCK=true`): при блоке бот меняет прокси, не трогая cookies (`ProxyPool`, `ws.proxy_rotations`). Файл прокси перечитывается на лету (`load_proxies`). Тест `ProxySupportTest` |
 | Пропускаем заявки (хотя предиктив включён) | `predict_loop`: дойдя до `PREDICTIVE_TAKE_LOOKAHEAD`, курсор ВОЗВРАЩАЕТСЯ к якорю и диапазон прогоняется заново (retry) — иначе id пробуется лишь раз, и заявка, чей id появился позже, теряется. Тест `test_predict_loop_does_not_run_past_lookahead`. Проверьте, что `PREDICTIVE_TAKE_LOOKAHEAD>0` (иначе повторов нет) и `PREDICTIVE_TAKE_GAP_MS` не слишком большой |
 | Заявку не берём, хотя она ещё доступна (`still_available`/`unknown`) | `_do_take` ограниченно повторяет POST (`TAKE_RETRY_COUNT`, `TAKE_RETRY_DELAY_MS`), если `_confirm_taken` не подтвердил. `taken`/`gone` и предсказанные id не повторяются. В `metrics.jsonl` — поле `attempt`. Тест `TakeRetryTest` |
-| Взяли заявку или нет — что ответил сервер | `_classify_take_response()` по телу `POST take_payout` (`TAKE_REPLY_*`); дамп `./data/take_request_http_*.json` (`text_head` до `TAKE_DUMP_BODY_CHARS` + `server_reply`); ground truth всё равно `_confirm_taken` по demands. `unknown` = ответ не похож на страницу очереди (редирект на дашборд) |
+| Взяли заявку или нет — что ответил сервер | `_classify_take_response()` по телу `POST take_payout` (`TAKE_REPLY_*`); дамп `./data/take_request_http_*.json` (`text_head` до `TAKE_DUMP_BODY_CHARS` + `server_reply`); ground truth всё равно `_confirm_taken` по demands, **кроме предсказанных id с ответом `gone`** (тогда `confirmed=False` без GET — иначе 63k предсказанных POST дают ~126k лишних GET). `unknown` = ответ не похож на страницу очереди (редирект на дашборд) |
 | «Не вижу предиктивных POST» | они есть, но по умолчанию не дампятся и молчат. Ищите в `./data/metrics.jsonl` записи с `"predicted": true` (и `poll_rtt_ms=null`), строку лога `🔮 превентивно: окно …`; дампы — `PREDICTIVE_TAKE_DUMPS=true` |
 | «🔮 Превентивно…» дублируется в Telegram | так было раньше: сообщение слалось раз в `PREDICTIVE_NOTIFY_MIN_S` (3с) с неизменным якорем (`observed_anchor`). Теперь — один раз на НОВЫЙ якорь и с реальным окном `#a…#b`. Тишина: `DEBUG=false` |
 | Счётчик очереди расходится | сверка `DEMANDS_URL`, `resync_demand*s`, `/reset_session` |
@@ -78,5 +78,16 @@
 
 ```bash
 python tools/check_accounts.py         # кабинеты, сессии, бэкенд
+python -m app.main --check             # конфиг + импорты, без бота и без сети
 python -m app.main                     # запуск (нужен валидный .env)
 ```
+
+Две «страшные» ошибки на старте — не крэш:
+
+- `ImportError: attempted relative import with no known parent package` — файл
+  запускали как `python app/main.py`; точка входа это переживает (сама правит
+  `sys.path`), но правильный запуск — `python -m app.main` из корня.
+- `telegram.error.Conflict: terminated by other getUpdates request` — уже
+  работает второй экземпляр бота (локальный запуск + контейнер). Процесс жив,
+  но апдейты забирает другой; остановите лишний (`pgrep -fl app.main`,
+  `docker compose ps`). Конфликт логируется одной строкой через `error_callback`.

@@ -1,11 +1,24 @@
 import asyncio
 import logging
+import os
+import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
+from telegram.error import Conflict
 
-from .config import load_config
-from .state import state
-from .telegram_bot import build_bot_app
+# Прямой запуск файла (`python app/main.py`) выставляет __package__ = "" и тогда
+# относительные импорты ниже падают с ImportError: attempted relative import
+# with no known parent package. Добавляем корень проекта в sys.path и объявляем
+# пакет, чтобы работали ОБА способа запуска: `python -m app.main` и
+# `python app/main.py`. Блок обязан идти ДО относительных импортов.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "app"  # noqa: A001 — так относительные импорты резолвятся в app.*
+
+from .config import load_config  # noqa: E402
+from .state import state  # noqa: E402
+from .telegram_bot import build_bot_app  # noqa: E402
 
 load_dotenv()  # локально читает .env; в Docker переменные уже в окружении
 
@@ -19,8 +32,6 @@ logger = logging.getLogger("main")
 def _pick_worker():
     """WORKER_BACKEND=http  — горячий цикл на httpx, без браузера (по умолчанию).
     WORKER_BACKEND=browser — прежний Playwright-воркер (безопасный откат)."""
-    import os
-
     backend = os.environ.get("WORKER_BACKEND", "http").lower()
     if backend == "browser":
         from .browser_worker import run_worker
@@ -28,6 +39,71 @@ def _pick_worker():
         from .http_worker import run_worker
     logger.info("Worker backend: %s", backend)
     return run_worker, backend
+
+
+async def _warn_if_duplicate_instance(application) -> None:
+    """Проверяем, не опрашивает ли бота ДРУГОЙ процесс (409 Conflict).
+
+    Частый случай: рядом с `docker compose up` запускают ещё и локальный
+    `python -m app.main`. Telegram разрешает только один getUpdates, поэтому
+    второй экземпляр получает `telegram.error.Conflict`, а telegram.ext пишет в
+    лог многострочный traceback «Exception happened while polling» — со стороны
+    это выглядит как падение сервиса. Здесь объясняем причину заранее.
+
+    Проба безопасна: offset=-1 отдаёт последний апдейт, НЕ подтверждая его
+    (подтверждение происходит только при offset = update_id + 1), поэтому
+    start_polling() следом получит все накопившиеся апдейты как обычно.
+    """
+    try:
+        await application.bot.get_updates(offset=-1, timeout=0, limit=1)
+    except Conflict:
+        logger.error(
+            "Обнаружен ДРУГОЙ запущенный экземпляр этого бота (409 Conflict): "
+            "getUpdates уже кем-то опрашивается. Остановите лишний процесс "
+            "(например, локальный запуск при работающем docker compose) — иначе "
+            "апдейты будут теряться и в логе будут ошибки polling."
+        )
+    except Exception as exc:  # сеть недоступна и т.п. — не мешаем запуску
+        logger.warning("Не удалось проверить дубликат экземпляра бота: %s", exc)
+
+
+def _on_polling_error(exc: Exception) -> None:
+    """Колбэк ошибок long-polling (передаётся в start_polling).
+
+    Штатный поведение telegram.ext — залогировать КАЖДУЮ ошибку опроса полным
+    многострочным traceback'ом. Для 409 Conflict это создаёт ложное впечатление
+    крэша, хотя процесс жив и продолжает работать. Здесь Conflict объясняется
+    одной понятной строкой, остальные ошибки логируются как раньше.
+    """
+    if isinstance(exc, Conflict):
+        logger.error(
+            "409 Conflict: бота опрашивает ДРУГОЙ экземпляр (getUpdates уже занят). "
+            "Это НЕ крэш — процесс продолжает работу, но апдейты может забирать "
+            "другой процесс. Остановите лишний экземпляр (например, локальный "
+            "запуск при работающем docker compose) и перезапустите этот."
+        )
+        return
+    logger.error("Ошибка при опросе Telegram: %s: %s", type(exc).__name__, exc)
+
+
+def _run_self_check() -> int:
+    """`python app/main.py --check` — проверить импорты и конфиг БЕЗ запуска бота.
+
+    Полезно, когда сервис «не стартует»: команда показывает, читается ли .env,
+    сколько кабинетов и админов распознано, и не требует сети/Telegram.
+    """
+    cfg = load_config()
+    run_worker, backend = _pick_worker()
+    logger.info(
+        "Проверка OK: backend=%s, кабинетов=%d (%s), админов=%d, прокси=%d",
+        backend,
+        len(cfg.accounts),
+        ", ".join(f"{a.index}:{a.name}" for a in cfg.accounts),
+        len(cfg.allowed_chat_ids),
+        len(getattr(cfg, "proxy_urls", []) or []),
+    )
+    logger.info("Точка входа: %s", getattr(run_worker, "__module__", run_worker))
+    return 0
 
 
 async def main():
@@ -68,7 +144,12 @@ async def main():
 
     async with application:
         await application.start()
-        await application.updater.start_polling()
+        # Проверяем дубликат ДО start_polling: иначе второй экземпляр зальёт лог
+        # многострочными traceback'ами Conflict и это будет похоже на крэш.
+        await _warn_if_duplicate_instance(application)
+        # error_callback превращает 409 Conflict из «страшного traceback» в одну
+        # понятную строку: конфликт двух экземпляров — не крэш процесса.
+        await application.updater.start_polling(error_callback=_on_polling_error)
         logger.info("Telegram bot polling started; admins=%s", cfg.allowed_chat_ids)
 
         # Свой воркер на каждый кабинет: задача живёт постоянно и ждёт,
@@ -99,5 +180,8 @@ async def main():
 
 
 if __name__ == "__main__":
+    # --check — быстрая проверка окружения/конфига без запуска бота и без сети.
+    if any(arg in ("--check", "-c") for arg in sys.argv[1:]):
+        sys.exit(_run_self_check())
     asyncio.run(main())
 

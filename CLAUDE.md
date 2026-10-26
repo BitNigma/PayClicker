@@ -25,6 +25,7 @@ pip install -r requirements.txt && playwright install chromium
 # запуск
 cp .env.example .env      # заполнить
 python -m app.main        # или: docker compose up --build
+python -m app.main --check  # проверить конфиг/импорты без запуска бота и без сети
 
 # тесты (офлайн, из корня проекта)
 python -m unittest discover -s tests -t .
@@ -122,6 +123,12 @@ ID заявок на площадке идут по порядку, поэтом
 страницей demands (`_confirm_taken`). Маркеры задаются в env только если формулировки
 площадки известны (`TAKE_SUCCESS_MARKERS` / `TAKE_GONE_MARKERS`, по умолчанию пусто).
 
+**Исключение для предсказанных id.** Если `predicted=True` и сервер ответил `gone`,
+подтверждение через demands НЕ делается (`confirmed=False` сразу): заявки, которой ещё
+нет, в demands быть не может, а каждый лишний GET — нагрузка. По `metrics.jsonl` 63k
+предсказанных POST давали ~126k GET ради одного результативного взятия. Для `taken` и
+`unknown` подтверждение остаётся. Тест `test_predicted_gone_skips_demand_confirmation`.
+
 **Повтор POST при неоднозначном ответе.** Если классификация вернула `still_available`
 или `unknown`, а `_confirm_taken` взятие НЕ подтвердил, `_do_take` ограниченно повторяет
 `POST take_payout` (`TAKE_RETRY_COUNT`, по умолчанию 2; пауза `TAKE_RETRY_DELAY_MS`).
@@ -209,6 +216,7 @@ proxy=...)`), и в браузерной авторизации (`_build_context
 - `tests/test_http_worker.py` — парсер строк, `PayoutClient`, учёт слотов demands (часть тестов на реальных дампах из `./data`, иначе `skipUnless`).
 - `tests/test_config.py` — env → Config/Account/админы.
 - `tests/test_telegram_flow.py` — обработчики команд.
+- `tests/test_main.py` — точка входа: `--check`, выбор бэкенда, понятный лог 409 Conflict, прямой запуск `python app/main.py` без ImportError.
 Все тесты офлайновые; сеть не нужна.
 
 ## Конвенции и «грабли»

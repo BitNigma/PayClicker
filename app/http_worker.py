@@ -739,7 +739,14 @@ async def _do_take(
 
             t_confirm = time.perf_counter()
             try:
-                if predicted:
+                if predicted and server_reply == TAKE_REPLY_GONE:
+                    # Сервер уже сказал «такой заявки нет» — подтверждать нечего.
+                    # Раньше здесь всё равно уходило до 2 GET на страницу demands,
+                    # и на 63k предсказанных POST это давало ~126k лишних GET
+                    # (прямой путь к бану Cloudflare). Не подтверждаем: заявки,
+                    # которой ещё нет, в demands быть не может.
+                    confirmed = False
+                elif predicted:
                     # Предсказанные id подтверждаем дешевле: большинство из них ещё
                     # не существуют, а лишние GET на limits-страницу приближают блок.
                     confirmed = await _confirm_taken(client, cfg, order_id, attempts=2, delay=0.25)

@@ -397,7 +397,7 @@ class TakeRetryTest(unittest.TestCase):
     """
 
     def _run(self, *, post_html, demands_html, predicted=False,
-             retry_count=2, retry_delay_ms=0):
+             retry_count=2, retry_delay_ms=0, demands_calls=None):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_config(
                 take_retry_count=retry_count,
@@ -416,6 +416,8 @@ class TakeRetryTest(unittest.TestCase):
                 )
 
             async def fetch_demands():
+                if demands_calls is not None:
+                    demands_calls.append(1)
                 return demands_html
 
             client = mock.Mock()
@@ -463,6 +465,39 @@ class TakeRetryTest(unittest.TestCase):
             post_html=still, demands_html=_page_html(), predicted=True, retry_count=2
         )
         self.assertEqual(posts, ["7001"])                   # предсказанные не повторяем
+
+    def test_predicted_gone_skips_demand_confirmation(self):
+        """Предсказанный id с ответом «заявки нет» НЕ подтверждаем через GET.
+
+        Сервер уже сказал, что такой заявки нет — подтверждать нечего, а каждый
+        GET на demands лишний. По metrics.jsonl 63k предсказанных POST давали
+        ~126k GET ради одного результативного взятия — это и есть путь к бану.
+        """
+        gone = _page_html()                                  # в ответе нет нашей строки → gone
+        demands_calls: list = []
+        confirmed, posts, lines = self._run(
+            post_html=gone, demands_html=_page_html(), predicted=True,
+            retry_count=2, demands_calls=demands_calls,
+        )
+        self.assertFalse(confirmed)
+        self.assertEqual(posts, ["7001"])                    # POST ровно один
+        self.assertEqual(demands_calls, [])                  # GET на demands НЕ делался
+        take = next(r for r in lines if r.get("event") == "take")
+        self.assertEqual(take["server_reply"], TAKE_REPLY_GONE)
+        result = next(r for r in lines if r.get("event") == "take_result")
+        self.assertFalse(result["confirmed"])
+
+    def test_predicted_still_available_still_confirms(self):
+        """Предсказанный id, который ещё в очереди, по-прежнему подтверждаем."""
+        still = _page_html(_row_html("7001", "Ждет провайдера"))
+        demands_calls: list = []
+        confirmed, posts, _ = self._run(
+            post_html=still, demands_html=_page_html(), predicted=True,
+            demands_calls=demands_calls,
+        )
+        self.assertFalse(confirmed)
+        self.assertEqual(posts, ["7001"])
+        self.assertEqual(len(demands_calls), 2)              # attempts=2, как и раньше
 
     def test_no_retry_when_confirmed(self):
         still = _page_html(_row_html("7001", "Ждет провайдера"))
