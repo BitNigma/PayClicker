@@ -31,14 +31,20 @@ from app.http_worker import (
     TAKE_REPLY_UNKNOWN,
     _classify,
     _classify_take_response,
+    _confirm_taken,
     _do_take,
     _dump_take_request,
     _effective_pollers,
+    _extract_status,
     _fire_predicted_window,
+    _first_td_text,
+    _is_available_status,
+    _is_taken_status,
     _observe_queue,
     _poll_loop,
     _poll_wait,
     _recover_from_block,
+    _take_form_block,
     ProxyPool,
     load_proxies,
     mask_proxy,
@@ -1251,6 +1257,66 @@ def _page_html(*rows: str) -> str:
     )
 
 
+def _spa_row_html(order_id: str, status: str, with_button: bool = True) -> str:
+    """Строка таблицы SPA-площадки: id обычным текстом в ПЕРВОЙ ячейке.
+
+    Разметка повторяет реальную страницу выплат (Vue): <tr class="payout-unassigned-neon">,
+    id в <td> с комментарием <!---->, статус — обычным текстом рядом с цветной
+    точкой (бейджа с классом badge нет), кнопка взятия — «⚡ Взять».
+    """
+    button = (
+        '<button type="button" class="payout-take-btn whitespace-nowrap">⚡ Взять</button>'
+        if with_button
+        else ""
+    )
+    return (
+        '<tr data-v-afa4089b="" class="payout-unassigned-neon">'
+        f'<td data-v-afa4089b="" class="whitespace-nowrap">{order_id}<!----></td>'
+        '<td data-v-afa4089b="" class="whitespace-nowrap">'
+        '<div class="text-nowrap font-medium">5005.00 RUB </div>'
+        '<div class="text-nowrap text-grey">59.14 USDT </div>'
+        "</td>"
+        '<td data-v-afa4089b="" class="whitespace-nowrap">Реквизит — после принятия</td>'
+        '<td data-v-afa4089b="" class="whitespace-nowrap">'
+        '<div class="h-2 w-2 rounded-full"></div> ' + status + "</td>"
+        '<td data-v-afa4089b=""><p class="inline-block">2026-10-31 01:44:08</p></td>'
+        f'<td data-v-afa4089b="" class="text-right">{button}</td>'
+        "</tr>"
+    )
+
+
+def _spa_page_html(*rows: str) -> str:
+    return (
+        "<!DOCTYPE html><html><body>"
+        '<table data-v-afa4089b="" class="w-full payouts-compact"><thead>'
+        "<tr><th>ID</th><th>Сумма</th><th>Реквизиты</th><th>Статус</th>"
+        "<th>Создан</th><th>Действия</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></body></html>"
+    )
+
+
+def _spa_config(**overrides) -> Config:
+    """Конфиг SPA-площадки: id из первой ячейки, без csrf, статус обычным текстом."""
+    base = dict(
+        site_host="spa.example",
+        queue_url="https://spa.example/payouts?sub=payouts_choice",
+        demands_url="https://spa.example/payouts?tab=common",
+        payout_row_markers=("payouts-compact", "payout-unassigned-neon"),
+        row_id_from_first_cell=True,
+        take_requires_csrf=False,
+        take_payload_format="json",
+        take_csrf_field="",
+        take_access_key_field="",
+        take_act_field="",
+        take_act_value="",
+        queue_page_markers=("payouts-compact",),
+        confirm_requires_in_work=True,
+    )
+    base.update(overrides)
+    return make_config(**base)
+
+
 def _start_payout_server(queue_html, demands_html=None):
     """Локальный «сайт»: страница очереди и страница demands отдаются разными путями.
 
@@ -1779,6 +1845,218 @@ class DemandsSlotAccountingTest(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class SpaPlatformTest(unittest.TestCase):
+    """SPA-площадка: id обычным текстом в первой ячейке, статус — обычным текстом.
+
+    Разметка взята с реальной страницы выплат (Vue): <tr class="payout-unassigned-neon">,
+    id в первой <td> с комментарием <!---->, статус «Не назначено»/«В работе»
+    рядом с цветной точкой (без бейджа badge), кнопка взятия «⚡ Взять».
+    """
+
+    def test_parses_row_with_id_in_first_cell(self):
+        cfg = _spa_config()
+        rows = parse_rows(_spa_page_html(_spa_row_html("14661", "Не назначено")), cfg)
+        self.assertEqual([r["id"] for r in rows], ["14661"])
+        self.assertEqual(rows[0]["status"], "не назначено")
+        self.assertIsNone(rows[0]["csrf_token"])
+        self.assertEqual(rows[0]["access_key"], "")
+
+    def test_extract_status_from_spa_row(self):
+        cfg = _spa_config()
+        block = _spa_row_html("14661", "Не назначено")
+        text = "14661 5005.00 RUB 59.14 USDT Реквизит — после принятия Не назначено"
+        self.assertEqual(_first_td_text(block), "14661")
+        self.assertEqual(_extract_status(block, text, cfg), "не назначено")
+
+    def test_in_work_row_occupies_slot(self):
+        cfg = _spa_config()
+        rows = parse_rows(
+            _spa_page_html(
+                _spa_row_html("14661", "Не назначено"),
+                _spa_row_html("14662", "В работе", with_button=False),
+            ),
+            cfg,
+        )
+        self.assertEqual({r["id"] for r in rows}, {"14661", "14662"})
+        self.assertEqual(in_work_ids(rows, cfg), {"14662"})
+
+    def test_available_status_helper(self):
+        cfg = _spa_config()
+        # Доступна / неизвестна → можно брать.
+        self.assertTrue(_is_available_status("Не назначено", cfg))
+        self.assertTrue(_is_available_status("", cfg))
+        # В работе / завершена → брать нельзя.
+        self.assertFalse(_is_available_status("В работе", cfg))
+        self.assertFalse(_is_available_status("Выполнена", cfg))
+        # _is_taken_status — ровно наоборот для известных статусов.
+        self.assertTrue(_is_taken_status("В работе", cfg))
+        self.assertTrue(_is_taken_status("Выполнена", cfg))
+        self.assertFalse(_is_taken_status("Не назначено", cfg))
+
+    def test_take_form_block_finds_row_by_first_cell(self):
+        cfg = _spa_config()
+        html = _spa_page_html(_spa_row_html("14661", "Не назначено"))
+        block = _take_form_block(html, "14661", cfg)
+        self.assertIn("14661", block)
+        self.assertIn("Взять", block)
+        self.assertEqual(_take_form_block(html, "99999", cfg), "")
+
+    def test_classify_spa_response(self):
+        cfg = _spa_config()
+        # Наша строка ещё в очереди → не взяли.
+        html = _spa_page_html(_spa_row_html("14661", "Не назначено"))
+        self.assertEqual(
+            _classify_take_response(html, "14661", cfg), TAKE_REPLY_STILL_AVAILABLE
+        )
+        # Наша строка уже в работе → взяли.
+        html = _spa_page_html(_spa_row_html("14661", "В работе", with_button=False))
+        self.assertEqual(_classify_take_response(html, "14661", cfg), TAKE_REPLY_TAKEN)
+        # Нашей строки нет, но страница очереди есть → заявки больше нет.
+        html = _spa_page_html(_spa_row_html("99999", "Не назначено"))
+        self.assertEqual(_classify_take_response(html, "14661", cfg), TAKE_REPLY_GONE)
+
+    def test_classify_json_api_response(self):
+        cfg = _spa_config(take_gone_markers=("already", "not found"))
+        self.assertEqual(
+            _classify_take_response('{"success": true}', "14661", cfg), TAKE_REPLY_TAKEN
+        )
+        self.assertEqual(_classify_take_response('{"ok": 1}', "14661", cfg), TAKE_REPLY_TAKEN)
+        self.assertEqual(
+            _classify_take_response('{"error": "payout already taken"}', "14661", cfg),
+            TAKE_REPLY_GONE,
+        )
+        self.assertEqual(
+            _classify_take_response('{"foo": "bar"}', "14661", cfg), TAKE_REPLY_UNKNOWN
+        )
+
+
+    def test_take_payload_for_spa_has_only_id(self):
+        cfg = _spa_config(take_id_field="id")
+        client = PayoutClient(cfg, {})
+        try:
+            # csrf и access_key приходят из HTML, но полей в конфиге нет —
+            # значит в тело они не попадают: SPA берёт токен из cookie.
+            payload = client._take_payload("14661", "csrf-из-сессии", "key")
+        finally:
+            asyncio.run(client.aclose())
+        self.assertEqual(payload, {"id": "14661"})
+
+    def test_take_payload_for_server_form_keeps_fields(self):
+        cfg = make_config()
+        client = PayoutClient(cfg, {})
+        try:
+            payload = client._take_payload("7001", "tok", "key")
+        finally:
+            asyncio.run(client.aclose())
+        self.assertEqual(
+            payload,
+            {
+                "payout_id": "7001",
+                "act": "take_payout",
+                "csrf_token": "tok",
+                "access_key": "key",
+            },
+        )
+
+    def _confirm(self, cfg, html, order_id: str = "14661"):
+        async def run():
+            client = mock.Mock()
+
+            async def fetch_demands():
+                return html
+
+            client.fetch_demands = fetch_demands
+            return await _confirm_taken(client, cfg, order_id, attempts=2, delay=0.0)
+
+        return asyncio.run(run())
+
+    def test_confirm_requires_in_work_rejects_available_row(self):
+        """SPA с общей таблицей: строка «Не назначено» — заявка ещё НЕ наша."""
+        cfg = _spa_config(confirm_requires_in_work=True)
+        html = _spa_page_html(_spa_row_html("14661", "Не назначено", with_button=False))
+        self.assertFalse(self._confirm(cfg, html))
+
+    def test_confirm_requires_in_work_accepts_in_work_row(self):
+        cfg = _spa_config(confirm_requires_in_work=True)
+        html = _spa_page_html(_spa_row_html("14661", "В работе", with_button=False))
+        self.assertTrue(self._confirm(cfg, html))
+
+    def test_confirm_without_flag_keeps_old_behaviour(self):
+        """По умолчанию (серверные формы) подтверждаем по факту появления строки."""
+        cfg = make_config(confirm_requires_in_work=False)
+        html = _page_html(_row_html("7001", "Ждет провайдера", with_form=False))
+        self.assertTrue(self._confirm(cfg, html, order_id="7001"))
+
+    def test_poll_loop_takes_only_available_rows(self):
+        """Опрос берёт заявку только со статусом «доступна», пропуская «в работе»."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _spa_config(
+                target_queue_size=5,
+                take_poll_min_ms=10,
+                take_poll_max_ms=20,
+                metrics_path=str(Path(tmp) / "m.jsonl"),
+                debug_capture_attempts=False,
+            )
+            ws = WorkerState(index=1, name="К")
+            ws.running, ws.mode = True, "take"
+            posted: list = []
+
+            class FakeClient:
+                def __init__(self):
+                    self.queue_calls = 0
+
+                async def fetch_queue(self):
+                    self.queue_calls += 1
+                    if self.queue_calls >= 2:
+                        ws.running = False
+                        # Вторая страница: доступных заявок больше нет.
+                        return _spa_page_html(
+                            _spa_row_html("14661", "В работе", with_button=False)
+                        )
+                    return _spa_page_html(
+                        _spa_row_html("14661", "В работе", with_button=False),
+                        _spa_row_html("14662", "Не назначено"),
+                    )
+
+                async def fetch_demands(self):
+                    return _spa_page_html(
+                        _spa_row_html("14662", "В работе", with_button=False)
+                    )
+
+                async def take_payout(self, order_id, csrf_token, access_key=""):
+                    posted.append(order_id)
+                    return httpx.Response(
+                        200,
+                        json={"success": True},
+                        request=httpx.Request("POST", cfg.queue_url),
+                    )
+
+            client = FakeClient()
+
+            async def notify(_text):
+                pass
+
+            async def notify_file(*_args, **_kwargs):
+                pass
+
+            async def run():
+                inflight: set = set()
+                tasks: set = set()
+                await _poll_loop(
+                    client, cfg, cfg.accounts[0], ws, notify, notify_file,
+                    Metrics(cfg), inflight, tasks,
+                )
+                for _ in range(50):
+                    if not tasks:
+                        break
+                    await asyncio.sleep(0.02)
+
+            asyncio.run(run())
+            self.assertEqual(posted, ["14662"])
+            self.assertIn("14662", ws.taken_order_ids)
+            self.assertNotIn("14661", ws.taken_order_ids)
 
 
 if __name__ == "__main__":

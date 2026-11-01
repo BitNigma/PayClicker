@@ -49,6 +49,7 @@ python tools/metrics_report.py    # отчёт по ./data/metrics.jsonl
 | `telegram_bot.py` | обработчики команд, диалоги выбора кабинета, маршрутизация 2FA |
 | `http_worker.py` | **ГОРЯЧИЙ ЦИКЛ** на httpx: `run_worker`, `take_loop`, `watch_loop`, `PayoutClient`, парсер HTML, `Metrics` |
 | `browser_worker.py` | Playwright: разовая авторизация (`login_via_browser`, `ensure_logged_in`) + старый browser-цикл (fallback) |
+| `take_capture.py` | **режим обучения**: видимое окно с сохранённой сессией, автообновление очереди, клик по кнопке взятия и перехват реального запроса/ответа → рецепт для `TAKE_API_URL_TEMPLATE`/`TAKE_PAYLOAD_FORMAT` (пока API площадки неизвестен) |
 
 ## Поток: от Telegram до заявки
 
@@ -203,8 +204,80 @@ proxy=...)`), и в браузерной авторизации (`_build_context
 (`http`|`browser`), `HTTP_TIMEOUT_S`, `DEBUG_CAPTURE_ATTEMPTS`, `HEADLESS`,
 `BLOCK_REAUTH_ATTEMPTS`, `PREDICTIVE_TAKE`, `PREDICTIVE_TAKE_COUNT`,
 `PREDICTIVE_TAKE_GAP_MS`, `PREDICTIVE_TAKE_LOOKAHEAD`, `PREDICTIVE_TAKE_POLL_MS`, `PREDICTIVE_TAKE_DUMPS`, `DEBUG`,
-`TAKE_SUCCESS_MARKERS`, `TAKE_GONE_MARKERS`, `STORAGE_STATE_PATH`, `LOG_PATH`, `METRICS_PATH`.
+`TAKE_SUCCESS_MARKERS`, `TAKE_GONE_MARKERS`, `STORAGE_STATE_PATH`, `LOG_PATH`, `METRICS_PATH`,
+`TAKE_CSRF_HEADER`/`TAKE_CSRF_COOKIE` (SPA: csrf в заголовке из cookie, напр.
+`X-XSRF-TOKEN` ← `XSRF-TOKEN`), `QUEUE_JSON_ID_FIELD`/`QUEUE_JSON_STATUS_FIELD`
+(SPA/Inertia: `uuid`/`status` в `props.payouts.data`).
 Полный список и комментарии — `.env.example`.
+
+### Профиль площадки (другая площадка без правки кода)
+
+Разметка/эндпоинты вынесены в `Config` (дефолты = `spark-trading.cash`), поэтому
+переезд делается только через env: `SITE_HOST`, `SIGNIN_PATH`, `PAYOUT_ROW_MARKERS`,
+`PAYOUT_TAKE_BUTTON_MARKERS`, `STATUS_AVAILABLE_MARKERS`, `STATUS_IN_WORK_MARKERS`,
+`STATUS_DONE_MARKERS`, `EMPTY_ROW_TEXT`, `ROW_ID_TEXT_PATTERN`,
+`ROW_ID_FROM_FIRST_CELL`, `TAKE_API_URL_TEMPLATE`, `TAKE_PAYLOAD_FORMAT`,
+`TAKE_ID_FIELD`, `TAKE_CSRF_FIELD`, `TAKE_ACCESS_KEY_FIELD`, `TAKE_ACT_FIELD`,
+`TAKE_ACT_VALUE`, `TAKE_REQUIRES_CSRF`, `QUEUE_PAGE_MARKERS`, `LOGIN_FORM_MARKERS`,
+`CONFIRM_REQUIRES_IN_WORK`, `SPA_EMAIL_SELECTOR`, `SPA_PASSWORD_SELECTOR`,
+`SPA_NEXT_SELECTOR`, `SPA_SUBMIT_SELECTOR`, `SPA_TWOFA_INPUT_SELECTOR`.
+Порядок переезда и пример SPA-профиля — `LOCAL_RUN.md` (разделы 6 и 6a).
+
+**SPA на Laravel + Inertia (911pay)** — отдельный случай: очередь приходит не HTML-таблицей,
+а JSON'ом `props.payouts.data` (в теле XHR или в `data-page="…"` обычного GET), id заявки —
+`uuid`, статус — код (`unassigned`/`pending`/`wait_admin`/`returned_to_trader`/`success`/
+`canceled`/`expired`), а взятие — `POST /trader/payouts/{uuid}/claim` **без тела** с csrf
+в заголовке `X-XSRF-TOKEN` (значение cookie `XSRF-TOKEN`, URL-decode). Настройки:
+`TAKE_PAYLOAD_FORMAT=none`, `TAKE_API_URL_TEMPLATE=…/{id}/claim`,
+`TAKE_CSRF_HEADER=X-XSRF-TOKEN`, `TAKE_CSRF_COOKIE=XSRF-TOKEN`,
+`QUEUE_JSON_ID_FIELD=uuid`, `QUEUE_JSON_STATUS_FIELD=status`, `TAKE_GONE_MARKERS=срок выплаты истёк`.
+`parse_rows()` сам распознаёт Inertia JSON/`data-page` и переводит код статуса в текст
+(`_STATUS_CODE_LABELS`), поэтому `STATUS_*_MARKERS` продолжают работать. При
+`CONFIRM_REQUIRES_IN_WORK=true` подтверждением считается ТОЛЬКО статус «в работе» —
+иначе отменённая/истёкшая строка в demands выглядела бы как удачное взятие.
+Сигнатура снята инструментом `python -m app.take_capture` (см. ниже).
+
+**3-шаговый SPA-вход** (Email -> Password -> 2FA): `_fill_login_credentials`
+определяет режим по наличию поля `#email` — если оно есть, это SPA и шаги
+сменяются на одной странице (`#email` → «Далее» → `#password` → «Войти» →
+`#twofa-code` → «Войти»); иначе работает прежняя серверная форма (email и пароль
+сразу в одной форме). После шага пароля бот проверяет поле 2FA ДО URL: SPA может
+остаться на том же роуте, и по URL шаг кода не угадать. Нестандартные id/тексты
+кнопок переопределяются через `SPA_*_SELECTOR` (см. `.env.example`).
+
+⚠️ **Неактивный шаг SPA остаётся в DOM** (`display:none`), поэтому «показан ли
+шаг» решается ТОЛЬКО через `_is_visible_any()` / `element.is_visible()`, а не
+через наличие селектора: `#password` существует с самого начала, и проверка по
+наличию приводила к пропуску «Далее» и таймауту на скрытом поле.
+
+⚠️ **Кнопка «Далее» отрисована `disabled=""`** и включается только после
+валидации email, которая на Vue висит на `blur`/`change`. `page.fill()` шлёт
+лишь `input`, поэтому кнопка остаётся серой: Playwright ждёт actionability
+(снятия `disabled`) до таймаута, клик не происходит — со стороны выглядит как
+«поле заполнилось, а «Далее» не нажалась, и браузер закрылся». Поэтому перед
+кликом бот снимает фокус (`_blur_active()`), затем вызывает `_click_next_step()`:
+короткий таймаут 5 с → Enter в поле (`type="submit"` внутри `<form>`) → снятие
+`disabled` в DOM последней попыткой. То же сделано для «Войти» после пароля.
+
+⚠️ **Путь страницы входа берётся из `SIGNIN_PATH`** (`/login` у 911pay,
+`/signin` у прежней площадки): `_on_signin(page, cfg)` использует его, а не
+жёсткий `/signin`. Иначе на `/login` бот считал, что уже ушёл со входа: не
+дожидался 2FA, пропускал повторный заход и мог сохранить нерабочую сессию как
+успешную.
+
+**SPA-таблица выплат** (рисуется JS, id — текстом в первой ячейке, статус —
+обычный текст рядом с цветной точкой, кнопка взятия шлёт JSON): включить
+`ROW_ID_FROM_FIRST_CELL=true`, `TAKE_REQUIRES_CSRF=false`, `TAKE_PAYLOAD_FORMAT=json`,
+`QUEUE_PAGE_MARKERS=payouts-compact` и **обязательно**
+`CONFIRM_REQUIRES_IN_WORK=true`. Иначе бот подтвердит взятие по самому факту
+строки с id, хотя такая таблица показывает и ещё свободные заявки.
+
+`CONFIRM_REQUIRES_IN_WORK=true` — `_confirm_taken` считает заявку нашей ТОЛЬКО
+при статусе «в работе/завершена»; `false` (дефолт) — прежнее поведение:
+появление строки с id в demands достаточно (серверные формы). Ответ на
+`POST take_payout` разбирает `_classify_take_response`: HTML-маркеры
+(`TAKE_SUCCESS_MARKERS`/`TAKE_GONE_MARKERS`) и JSON-API (`{"success":true}`,
+`{"ok":1}`, `{"taken":true}` → взяли; текст ошибки из `TAKE_GONE_MARKERS` → нет).
 
 > `load_dotenv()` **не перезаписывает** уже заданные env-переменные. Залипшие
 > `export SITE_LOGIN_2=…` из терминала перебьют `.env` — снимайте `unset`/чистый терминал

@@ -22,14 +22,16 @@ GET" и "отправили POST". Это и есть фактическое в�
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import json
 import logging
 import os
 import random
 import re
 import time
+from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -86,46 +88,283 @@ _BADGE_RE = re.compile(
 )
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
+# Первая ячейка строки таблицы — для SPA, где id лежит обычным текстом.
+_FIRST_TD_RE = re.compile(r"<td\b[^>]*>(.*?)</td>", re.S | re.I)
+
+
+def _cfg_str(cfg: Config | None, name: str, default: str) -> str:
+    """Строковое значение из конфига площадки с дефолтом (cfg=None → дефолт)."""
+    if cfg is None:
+        return default
+    return str(getattr(cfg, name, "") or default)
 
 
 def _strip_tags(value: str) -> str:
     return _WS_RE.sub(" ", _TAG_RE.sub(" ", value)).strip()
 
 
-def parse_rows(html: str) -> list[dict]:
-    """Строки заявок из HTML страницы выплат (очередь ИЛИ demands).
+def _cfg_markers(cfg: Config | None, name: str, default: tuple) -> tuple:
+    """Маркеры площадки из конфига с дефолтом текущей площадки (cfg=None)."""
+    if cfg is None:
+        return default
+    return tuple(getattr(cfg, name, ()) or default)
+
+
+def _row_markers(cfg: Config | None) -> tuple:
+    """Маркеры, по которым <tr> считается строкой заявки."""
+    return _cfg_markers(cfg, "payout_row_markers", ("payout-status", "payout-table"))
+
+
+def _status_markers(cfg: Config | None) -> tuple:
+    """Все известные тексты статусов: доступна + в работе + завершена."""
+    if cfg is None:
+        return (
+            "ждет провайдера",
+            "не назначено",
+            "в работе у провайдера",
+            "в работе",
+            "выполнена",
+            "выполнено",
+            "завершена",
+        )
+    return tuple(
+        tuple(getattr(cfg, "status_available_markers", ()))
+        + tuple(getattr(cfg, "status_in_work_markers", ()))
+        + tuple(getattr(cfg, "status_done_markers", ()))
+    )
+
+
+def _in_work_markers(cfg: Config | None) -> tuple:
+    """Тексты статуса «заявка в работе» — она занимает слот очереди."""
+    return _cfg_markers(cfg, "status_in_work_markers", (STATUS_IN_WORK_MARKER,))
+
+
+# SPA 911pay отдаёт статус КОДОМ (PayoutStatus.vue). Переводим код в текст,
+# который уже понимают status_*_markers из конфига — так одна и та же логика
+# работает и для HTML-таблиц, и для JSON/Inertia.
+_STATUS_CODE_LABELS = {
+    "unassigned": "Не назначено",
+    "pending": "В обработке",
+    "wait_admin": "Ожидает подтверждения",
+    "returned_to_trader": "Возвращена трейдеру",
+    "success": "Подтверждена",
+    "canceled": "Отменена",
+    "expired": "Истекла",
+}
+
+# Inertia (Laravel) кладёт состояние страницы в атрибут data-page="...json...".
+_DATA_PAGE_RE = re.compile(r'data-page="([^"]*)"', re.I)
+
+
+def _status_from_code(code: str) -> str:
+    """Код статуса SPA → человекочитаемый текст (неизвестный код оставляем как есть)."""
+    code = (code or "").strip()
+    return _STATUS_CODE_LABELS.get(code.lower(), code)
+
+
+def _is_in_work_status(status: str, cfg: Config | None) -> bool:
+    """Статус ЯВНО означает «заявка у нас / в обработке» (не завершена).
+
+    Нужен для строгой проверки взятия на SPA: там страница demands показывает ВСЕ
+    заявки, включая отменённые/истёкшие. Раньше в подтверждение попадали и
+    «завершённые» статусы, из-за чего НЕудачное взятие (ответ «срок выплаты
+    истёк», строка со статусом expired) выглядело как успешное.
+    """
+    low = (status or "").strip().lower()
+    if not low:
+        return False
+    return any(m in low for m in _in_work_markers(cfg) if m)
+
+
+def _available_markers(cfg: Config | None) -> tuple:
+    """Тексты статуса «заявку ещё можно взять»."""
+    return _cfg_markers(cfg, "status_available_markers", ("ждет провайдера", "не назначено"))
+
+
+def _done_markers(cfg: Config | None) -> tuple:
+    """Тексты статуса «заявка завершена» — слот очереди свободен."""
+    return _cfg_markers(cfg, "status_done_markers", ("выполнена", "выполнено", "завершена"))
+
+
+def _is_available_status(status: str, cfg: Config | None) -> bool:
+    """Можно ли ещё взять заявку с таким статусом.
+
+    False — только когда статус ЯВНО говорит, что заявка уже не в очереди
+    (в работе или завершена). Пустой/незнакомый статус считаем доступным:
+    на серверных формах очередь и так содержит только доступные заявки, а для
+    SPA-таблиц со всеми статусами это не даёт повторно брать «в работе».
+    """
+    low = (status or "").strip().lower()
+    if not low:
+        return True
+    busy = tuple(_in_work_markers(cfg)) + _done_markers(cfg)
+    return not any(m in low for m in busy if m)
+
+
+def _is_taken_status(status: str, cfg: Config | None) -> bool:
+    """Статус доказывает, что заявка наша: «в работе» или уже завершена."""
+    low = (status or "").strip().lower()
+    if not low:
+        return False
+    markers = tuple(_in_work_markers(cfg)) + _done_markers(cfg)
+    return any(m in low for m in markers if m)
+
+
+@lru_cache(maxsize=32)
+def _hidden_field_re(field: str, digits_only: bool = False) -> re.Pattern:
+    """Регулярка скрытого поля формы: name=<field> value=<...> (имя из конфига)."""
+    value = r"(\d+)" if digits_only else r"([^\"']*)"
+    return re.compile(
+        r"name=[\"']" + re.escape(field) + r"[\"']\s+value=[\"']" + value + r"[\"']", re.I
+    )
+
+
+def _first_td_text(block: str) -> str:
+    """Текст первой ячейки <td> строки (SPA: id лежит обычным текстом)."""
+    match = _FIRST_TD_RE.search(block)
+    return _strip_tags(match.group(1)).strip() if match else ""
+
+
+def _extract_status(block: str, text: str, cfg: Config | None) -> str:
+    """Статус строки: бейдж (серверные формы), иначе — известный текст статуса.
+
+    Для SPA бейджа нет, поэтому статус вытаскивается по маркерам из конфига:
+    «Не назначено» → доступна, «В работе» → в работе, «Выполнена» → завершена.
+    """
+    badge = _BADGE_RE.search(block)
+    if badge:
+        return _strip_tags(badge.group(1))
+    low = text.lower()
+    for marker in _status_markers(cfg):
+        if marker and marker in low:
+            return marker
+    return ""
+
+
+def _inertia_payload(html: str):
+    """JSON состояния Inertia-страницы: тело ответа ИЛИ атрибут data-page.
+
+    SPA на Laravel+Inertia отдаёт очередь двумя путями: при XHR-запросе —
+    JSON'ом, при обычном GET — HTML, внутри которого data-page="…json…" (SSR).
+    Возвращает dict или None (значит, это не Inertia-страница).
+    """
+    body = (html or "").strip()
+    if body.startswith("{"):
+        try:
+            data = json.loads(body)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            return data
+    match = _DATA_PAGE_RE.search(html or "")
+    if not match:
+        return None
+    try:
+        data = json.loads(html_lib.unescape(match.group(1)))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _inertia_rows(html: str, cfg: Config | None = None) -> list[dict] | None:
+    """Заявки из JSON Inertia (props.payouts.data) или None, если это не Inertia.
+
+    Для SPA id заявки — UUID (claim-URL строится по нему), статус — код
+    (unassigned/pending/success/…), который переводится в текст для *_markers.
+    """
+    payload = _inertia_payload(html)
+    if payload is None:
+        return None
+    props = payload.get("props")
+    if not isinstance(props, dict):
+        return None
+    payouts = props.get("payouts")
+    if not isinstance(payouts, dict) or "data" not in payouts:
+        return None
+    id_field = _cfg_str(cfg, "queue_json_id_field", "uuid") or "uuid"
+    status_field = _cfg_str(cfg, "queue_json_status_field", "status") or "status"
+    rows: list[dict] = []
+    for item in payouts.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        order_id = item.get(id_field) or item.get("uuid") or item.get("id")
+        if not order_id:
+            continue
+        rows.append(
+            {
+                "id": str(order_id),
+                "status": _status_from_code(str(item.get(status_field) or "")),
+                "csrf_token": None,
+                "access_key": "",
+            }
+        )
+    return rows
+
+
+def parse_rows(html: str, cfg: Config | None = None) -> list[dict]:
+    """Строки заявок из HTML/JSON страницы выплат (очередь ИЛИ demands).
 
     Возвращает список dict: id, status, csrf_token, access_key.
-    Строка-заглушка «Не найдено» и строки без признаков заявки пропускаются.
-    Одна и та же функция подходит и для очереди (есть форма take_payout),
-    и для demands (там id берётся из текста «# 6408416»).
+    Строка-заглушка «заявок нет» и строки без признаков заявки пропускаются.
+
+    cfg=None — разметка текущей площадки (скрытые поля формы + бейдж статуса).
+    cfg задан — маркеры строки, тексты статусов и источник id берутся из конфига,
+    поэтому функция работает и для SPA: там id лежит обычным текстом в первой
+    ячейке, статус — обычным текстом, а кнопка взятия — JS-кнопкой без формы.
+
+    Если ответ — Inertia JSON (или HTML с data-page) — разбираем props.payouts.data:
+    у SPA id заявки это UUID, а не число, и в HTML-таблицу он не попадает.
     """
+    inertia_rows = _inertia_rows(html, cfg)
+    if inertia_rows is not None:
+        return inertia_rows
     rows: list[dict] = []
+    markers = _row_markers(cfg)
+    id_re = _hidden_field_re(
+        _cfg_str(cfg, "take_id_field", "payout_id"), digits_only=True
+    )
+    empty_text = (_cfg_str(cfg, "empty_row_text", "") or EMPTY_ROW_TEXT).lower()
+    text_id_re = re.compile(_cfg_str(cfg, "row_id_text_pattern", "") or r"#\s*(\d+)")
+    from_cell = bool(getattr(cfg, "row_id_from_first_cell", False)) if cfg else False
+    csrf_re = _hidden_field_re(_cfg_str(cfg, "take_csrf_field", "csrf_token"))
+    access_re = _hidden_field_re(_cfg_str(cfg, "take_access_key_field", "access_key"))
     for match in _TR_RE.finditer(html):
         block = match.group(0)
-        # берём только строки таблицы заявок, а не любые другие <tr> на странице
-        if "payout-status" not in block.lower() and not _PAYOUT_ID_RE.search(block):
-            continue
+        low = block.lower()
         text = _strip_tags(block)
-        if not text or EMPTY_ROW_TEXT in text.lower():
+        if not text or empty_text in text.lower():
+            continue
+        # Первая ячейка нужна и для id (SPA), и для проверки «это строка заявки».
+        first_cell = _first_td_text(block) if from_cell else ""
+        # Строкой заявки считаем <tr>, если в ней есть маркер разметки, скрытое
+        # поле с id ИЛИ (для SPA) цифровой id в первой ячейке + известный статус.
+        # Последнее важно: после взятия площадка меняет класс строки, и по одному
+        # только классу строка «в работе» перестала бы распознаваться.
+        looks_like_row = (
+            any(m in low for m in markers)
+            or id_re.search(block)
+            or (from_cell and first_cell.isdigit() and bool(_extract_status(block, text, cfg)))
+        )
+        if not looks_like_row:
             continue
 
-        payout_id = _PAYOUT_ID_RE.search(block)
+        payout_id = id_re.search(block)
         if payout_id:
             order_id = payout_id.group(1)
         else:
-            fallback = _ROW_ID_TEXT_RE.search(text)
+            fallback = text_id_re.search(text)
             order_id = fallback.group(1) if fallback else None
+            if not order_id and from_cell and first_cell.isdigit():
+                order_id = first_cell
         if not order_id:
             continue
 
-        badge = _BADGE_RE.search(block)
-        csrf = _CSRF_RE.search(block)
-        access_key = _ACCESS_KEY_RE.search(block)
+        csrf = csrf_re.search(block)
+        access_key = access_re.search(block)
         rows.append(
             {
                 "id": order_id,
-                "status": _strip_tags(badge.group(1)) if badge else "",
+                "status": _extract_status(block, text, cfg),
                 "csrf_token": csrf.group(1) if csrf else None,
                 "access_key": access_key.group(1) if access_key else "",
             }
@@ -154,14 +393,28 @@ _TAKE_REPLY_TEXT = {
 }
 
 
-def _take_form_block(html: str, order_id: str) -> str:
-    """Строка таблицы очереди ровно с этим payout_id (или пустая строка)."""
+def _take_form_block(html: str, order_id: str, cfg: Config | None = None) -> str:
+    """Строка таблицы ровно с этим id заявки (или пустая строка).
+
+    Ищет по скрытому полю с id (серверные формы текущей площадки) ИЛИ, если это
+    включено конфигом, по тексту первой ячейки — так устроены SPA-площадки, где
+    id лежит обычным текстом, а кнопка взятия не является формой.
+    """
     needle = re.compile(
-        r"name=[\"']payout_id[\"']\s+value=[\"']" + re.escape(order_id) + r"[\"']", re.I
+        r"name=[\"']"
+        + re.escape(_cfg_str(cfg, "take_id_field", "payout_id"))
+        + r"[\"']\s+value=[\"']"
+        + re.escape(order_id)
+        + r"[\"']",
+        re.I,
     )
     for match in _TR_RE.finditer(html or ""):
         if needle.search(match.group(0)):
             return match.group(0)
+    if cfg is not None and getattr(cfg, "row_id_from_first_cell", False):
+        for match in _TR_RE.finditer(html or ""):
+            if _first_td_text(match.group(0)) == order_id:
+                return match.group(0)
     return ""
 
 
@@ -187,42 +440,71 @@ def _classify_take_response(html: str, order_id: str, cfg: Config) -> str:
         return TAKE_REPLY_GONE
     if any(m in low for m in getattr(cfg, "take_success_markers", ())):
         return TAKE_REPLY_TAKEN
-    block = _take_form_block(html or "", order_id)
+    # JSON-API площадок (SPA): POST отвечает объектом, а не HTML-страницей.
+    # {"success": true} / {"ok": 1} / {"taken": true} — явный признак взятия.
+    # Иначе смотрим текст ошибки на маркеры «заявки нет» из конфига.
+    text = (html or "").strip()
+    if text[:1] in ("{", "["):
+        try:
+            payload = json.loads(text)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            for key in ("success", "ok", "taken"):
+                value = payload.get(key)
+                if value is True or value == 1:
+                    return TAKE_REPLY_TAKEN
+            err = " ".join(
+                str(payload.get(k) or "") for k in ("error", "message", "detail", "status")
+            ).lower()
+            if err and any(m in err for m in getattr(cfg, "take_gone_markers", ())):
+                return TAKE_REPLY_GONE
+    block = _take_form_block(html or "", order_id, cfg)
     if block:
-        # Строка всё ещё предлагает «Забрать выплату» — проверяем её статус:
-        if STATUS_IN_WORK_MARKER in block.lower():
+        # Строка этого id ещё есть на странице — смотрим её статус:
+        low_block = block.lower()
+        if any(m in low_block for m in _in_work_markers(cfg)):
             return TAKE_REPLY_TAKEN
         return TAKE_REPLY_STILL_AVAILABLE
     # Нашей строки в ответе нет. Если это ВООБЩЕ страница очереди (есть таблица
     # выплат), значит нашей заявки в очереди больше нет: её забрали (мы/другие)
     # или её и не было (для предсказанного id). Неизвестно — только если страница
     # вообще не похожа на очередь (например, редирект на дашборд).
-    page_markers = ("payout-table", "payout-status", "payout-card")
+    page_markers = _cfg_markers(
+        cfg, "queue_page_markers", ("payout-table", "payout-status", "payout-card")
+    )
     if any(m in low for m in page_markers):
         return TAKE_REPLY_GONE
     return TAKE_REPLY_UNKNOWN
 
 
-def in_work_ids(rows: list[dict]) -> set[str]:
-    """id заявок, которые занимают слот целевой очереди (статус «в работе у провайдера»).
+def in_work_ids(rows: list[dict], cfg: Config | None = None) -> set[str]:
+    """id заявок, которые занимают слот целевой очереди (статус «в работе»).
 
     На странице demands это и заявки, взятые нами, и те, что площадка выдала
     автоматически (без нажатия «Забрать выплату»): место в очереди занимают обе
     категории, поэтому считаем их одинаково. Завершённые и ошибочные заявки сюда
     не попадают — их слот свободен.
+
+    Тексты статуса берутся из конфига площадки (cfg=None → текущая площадка):
+    для SPA это обычный текст «В работе», для серверных форм — бейдж.
     """
+    markers = _in_work_markers(cfg)
     return {
         r["id"]
         for r in rows
-        if r.get("id") and STATUS_IN_WORK_MARKER in (r.get("status") or "").lower()
+        if r.get("id") and any(m in (r.get("status") or "").lower() for m in markers)
     }
 
 
-def load_cookies(account) -> dict:
-    """Cookies сайта из storage_state (auth.json кабинета). Берём только домен spark-trading.cash.
+def load_cookies(account, cfg: Config | None = None) -> dict:
+    """Cookies сайта из storage_state (auth.json кабинета).
 
+    Берём только cookies домена площадки: он задаётся конфигом (cfg.site_host),
+    поэтому один и тот же auth.json-формат подходит для любой площадки.
     Формат auth.json — Playwright storage_state: {"cookies": [...], "origins": [...]}.
     """
+    host = _cfg_str(cfg, "site_host", SITE_HOST)
     path = Path(account.storage_state_path)
     if not path.exists():
         return {}
@@ -236,7 +518,7 @@ def load_cookies(account) -> dict:
         domain = str(cookie.get("domain", "")).lstrip(".")
         if not domain:
             continue
-        if SITE_HOST == domain or SITE_HOST.endswith("." + domain):
+        if host == domain or host.endswith("." + domain):
             cookies[cookie["name"]] = cookie["value"]
     return cookies
 
@@ -276,12 +558,18 @@ def _reset_stored_session(account) -> bool:
     return False
 
 
-def _classify(html: str, url: str) -> str:
-    """ok | signin | blocked — по содержимому ответа и итоговому URL."""
+def _classify(html: str, url: str, cfg: Config | None = None) -> str:
+    """ok | signin | blocked — по содержимому ответа и итоговому URL.
+
+    Путь страницы входа и маркеры формы берутся из конфига площадки
+    (cfg=None → текущая площадка: /signin + auth-form).
+    """
     low = html.lower()
     if any(m in low for m in _BLOCKED_MARKERS):
         return "blocked"
-    if "/signin" in url or "auth-form" in low:
+    signin_path = _cfg_str(cfg, "signin_path", "/signin")
+    login_markers = _cfg_markers(cfg, "login_form_markers", ("auth-form",))
+    if signin_path in url or any(m in low for m in login_markers):
         return "signin"
     return "ok"
 
@@ -400,8 +688,13 @@ class PayoutClient:
     def __init__(self, cfg: Config, cookies: dict, proxy: str | None = None):
         self.cfg = cfg
         self.proxy = proxy
+        # Нужны для SPA: csrf-токен берётся из cookie (XSRF-TOKEN), а не из HTML.
+        self.cookies = dict(cookies or {})
+        # Хост площадки задаётся конфигом (cfg=None не бывает — клиент всегда
+        # создаётся с Config), поэтому одна и та же логика работает на любой площадке.
+        self.site_host = _cfg_str(cfg, "site_host", SITE_HOST)
         kwargs = dict(
-            base_url=f"https://{SITE_HOST}",
+            base_url=f"https://{self.site_host}",
             cookies=cookies,
             headers=_default_headers(cfg),
             timeout=httpx.Timeout(cfg.http_timeout_s),
@@ -416,7 +709,7 @@ class PayoutClient:
         await self._client.aclose()
 
     def _check(self, response: httpx.Response) -> None:
-        kind = _classify(response.text, str(response.url))
+        kind = _classify(response.text, str(response.url), self.cfg)
         # 403/429 — сайт (Cloudflare/антибот) заблокировал HTTP-клиент: даже если
         # тело не похоже на challenge, продолжать опрос бессмысленно.
         if kind == "blocked" or response.status_code in (403, 429):
@@ -439,22 +732,89 @@ class PayoutClient:
         self._check(response)
         return response.text
 
-    async def take_payout(
-        self, order_id: str, csrf_token: str, access_key: str = ""
-    ) -> httpx.Response:
-        """POST ровно той формы, что и кнопка «Забрать выплату» в браузере."""
-        data = {
-            "csrf_token": csrf_token,
-            "act": "take_payout",
-            "payout_id": order_id,
-            "access_key": access_key,
-        }
+    def _take_payload(self, order_id: str, csrf_token: str | None, access_key: str) -> dict:
+        """Тело POST взятия: имена полей и значения берутся из конфига площадки.
+
+        Для серверных форм (текущая площадка) это скрытые поля формы:
+        csrf_token + act=take_payout + payout_id + access_key.
+        Для SPA поля другие — задаются через env, csrf может отсутствовать.
+        """
+        cfg = self.cfg
+        id_field = _cfg_str(cfg, "take_id_field", "payout_id")
+        # Пустая строка в конфиге = «поле не отправлять». Это нужно SPA/API:
+        # там нет ни csrf, ни access_key, ни act — только id заявки.
+        csrf_field = str(getattr(cfg, "take_csrf_field", "csrf_token") or "")
+        access_field = str(getattr(cfg, "take_access_key_field", "access_key") or "")
+        act_field = str(getattr(cfg, "take_act_field", "act") or "")
+        act_value = str(getattr(cfg, "take_act_value", "take_payout") or "")
+        data: dict = {id_field: order_id}
+        if act_field and act_value:
+            data[act_field] = act_value
+        if csrf_token and csrf_field:
+            data[csrf_field] = csrf_token
+        if access_field:
+            data[access_field] = access_key or ""
+        return data
+
+    def take_url(self, order_id: str) -> str:
+        """URL POST взятия: TAKE_API_URL_TEMPLATE с {id} или QUEUE_URL (форма)."""
+        template = _cfg_str(self.cfg, "take_api_url_template", "")
+        return template.replace("{id}", order_id) if template else self.cfg.queue_url
+
+    def _take_headers(self, order_id: str, csrf_token: str | None) -> dict:
+        """Заголовки POST: referer/origin + SPA-специфика (csrf в заголовке)."""
+        cfg = self.cfg
         headers = {
-            "referer": self.cfg.queue_url,
-            "origin": f"https://{SITE_HOST}",
-            "content-type": "application/x-www-form-urlencoded",
+            "referer": cfg.queue_url,
+            "origin": f"https://{self.site_host}",
         }
-        return await self._client.post(self.cfg.queue_url, data=data, headers=headers)
+        csrf_header = _cfg_str(cfg, "take_csrf_header", "")
+        if csrf_header:
+            token = csrf_token or ""
+            if not token:
+                cookie_name = _cfg_str(cfg, "take_csrf_cookie", "")
+                if cookie_name:
+                    # Сначала — ЖИВОЙ cookie-jar клиента: Laravel перевыставляет
+                    # XSRF-TOKEN в каждом ответе, и снимок из auth.json может
+                    # отставать. Значение из jar всегда актуальное.
+                    try:
+                        token = self._client.cookies.get(cookie_name) or ""
+                    except Exception:
+                        token = ""
+                    if not token:
+                        token = self.cookies.get(cookie_name) or ""
+            if token:
+                # Laravel кладёт в cookie URL-encoded значение — в заголовок
+                # должно уходить ДЕКОДИРОВАННОЕ (иначе 419 CSRF token mismatch).
+                headers[csrf_header] = unquote(token)
+            headers["x-requested-with"] = "XMLHttpRequest"
+            headers["accept"] = "application/json, text/plain, */*"
+        return headers
+
+    async def take_payout(
+        self, order_id: str, csrf_token: str | None, access_key: str = ""
+    ) -> httpx.Response:
+        """POST взятия заявки: форма по умолчанию или API-эндпоинт площадки.
+
+        TAKE_API_URL_TEMPLATE позволяет бить в отдельный API-эндпоинт ({id}
+        подставляется вместо id заявки; у SPA это UUID); если шаблон не задан —
+        POST уходит на QUEUE_URL, как обычная серверная форма «Забрать выплату».
+
+        TAKE_PAYLOAD_FORMAT: form (по умолчанию) | json | none (POST без тела).
+        none нужен SPA: id уже в URL (/trader/payouts/{uuid}/claim), тело пустое.
+        """
+        fmt = _cfg_str(self.cfg, "take_payload_format", "form").lower()
+        url = self.take_url(order_id)
+        headers = self._take_headers(order_id, csrf_token)
+        if fmt == "none":
+            return await self._client.post(url, headers=headers)
+        data = self._take_payload(order_id, csrf_token, access_key)
+        if fmt == "json":
+            headers["content-type"] = "application/json"
+            headers["accept"] = "application/json"
+            return await self._client.post(url, json=data, headers=headers)
+        headers["content-type"] = "application/x-www-form-urlencoded"
+        return await self._client.post(url, data=data, headers=headers)
 
 
 def _queue_snapshot_text(cfg: Config, ws: WorkerState) -> str:
@@ -532,7 +892,7 @@ async def ensure_session(
     сразу пройти авторизацию с нуля (используется при блокировке 403/антибот,
     когда старый cf_clearance «сгорел»).
     """
-    cookies = {} if force_reauth else load_cookies(account)
+    cookies = {} if force_reauth else load_cookies(account, cfg)
     if cookies:
         probe = PayoutClient(cfg, cookies, proxy=proxy)
         try:
@@ -547,7 +907,7 @@ async def ensure_session(
     ok = await login_via_browser(cfg, account, ws, notify, notify_file, proxy=proxy)
     if not ok:
         return None
-    return load_cookies(account) or None
+    return load_cookies(account, cfg) or None
 
 
 def _safe_text(response: httpx.Response) -> str:
@@ -573,6 +933,7 @@ def _dump_take_request(
     response: httpx.Response,
     server_reply: str | None = None,
     predicted: bool = False,
+    url: str = "",
 ) -> Path:
     """Сохраняет фактический HTTP POST и ответ — для сверки с версией на браузере.
 
@@ -590,14 +951,37 @@ def _dump_take_request(
     suffix = "_pred" if predicted else ""
     fp = d / f"take_request_http_{order_id}_{int(time.time())}{suffix}.json"
     body = _safe_text(response)
+    # Дамп должен повторять РЕАЛЬНЫЙ запрос: у SPA это POST без тела на
+    # /payouts/{uuid}/claim с csrf-заголовком, а не форма take_payout.
+    fmt = _cfg_str(cfg, "take_payload_format", "form").lower()
+    req_url = (
+        url
+        or _cfg_str(cfg, "take_api_url_template", "").replace("{id}", order_id)
+        or cfg.queue_url
+    )
+    if fmt == "none":
+        req_headers = {
+            "accept": "application/json, text/plain, */*",
+            "x-requested-with": "XMLHttpRequest",
+        }
+        csrf_header = _cfg_str(cfg, "take_csrf_header", "")
+        if csrf_header:
+            req_headers[csrf_header] = "<из cookie сессии>"
+        post_data = ""
+    elif fmt == "json":
+        req_headers = {"content-type": "application/json"}
+        post_data = json.dumps(data, ensure_ascii=False)
+    else:
+        req_headers = {"content-type": "application/x-www-form-urlencoded"}
+        post_data = "&".join(f"{k}={v}" for k, v in data.items())
     payload = {
         "transport": "httpx",
         "predicted": predicted,
         "request": {
-            "url": cfg.queue_url,
+            "url": req_url,
             "method": "POST",
-            "headers": {"content-type": "application/x-www-form-urlencoded"},
-            "post_data": "&".join(f"{k}={v}" for k, v in data.items()),
+            "headers": req_headers,
+            "post_data": post_data,
         },
         "response": {
             "url": str(response.url),
@@ -614,11 +998,28 @@ def _dump_take_request(
 async def _confirm_taken(
     client: PayoutClient, cfg: Config, order_id: str, attempts: int = 4, delay: float = 0.4
 ) -> bool:
-    """Быстрая проверка, что заявка реально появилась в нашей очереди на demands."""
+    """Быстрая проверка, что заявка реально появилась в нашей очереди на demands.
+
+    Где demands показывает ТОЛЬКО заявки в работе (серверные формы), достаточно
+    присутствия строки с нашим id. Где показываются ВСЕ заявки (SPA с общей
+    таблицей), одно присутствие ничего не доказывает — заявка может всё ещё
+    висеть в очереди доступных или быть отменённой. Для таких площадок
+    CONFIRM_REQUIRES_IN_WORK=true: подтверждаем ТОЛЬКО статус «в работе»
+    (`_is_in_work_status`), а не «завершена» — иначе ответ «срок выплаты истёк»
+    (строка expired в demands) выглядел бы как удачное взятие.
+    """
     for _ in range(attempts):
         try:
             html = await client.fetch_demands()
-            if any(r["id"] == order_id for r in parse_rows(html)):
+            for row in parse_rows(html, cfg):
+                if row["id"] != order_id:
+                    continue
+                if getattr(cfg, "confirm_requires_in_work", False) and not _is_in_work_status(
+                    row.get("status"), cfg
+                ):
+                    # Строго «в работе»: страница demands SPA показывает и
+                    # отменённые/истёкшие заявки — их нельзя считать взятием.
+                    continue
                 return True
         except SessionExpired:
             raise
@@ -643,7 +1044,7 @@ async def fetch_demand_rows(client: PayoutClient, ws: WorkerState) -> list[dict]
     except Exception as exc:
         logger.warning("[%s] сверка со страницей demands не удалась: %s", ws.name, exc)
         return None
-    return parse_rows(html)
+    return parse_rows(html, client.cfg)
 
 
 async def _do_take(
@@ -727,13 +1128,18 @@ async def _do_take(
                 not predicted or cfg.predictive_take_dumps
             ):
                 try:
-                    data = {
-                        "csrf_token": csrf_token,
-                        "act": "take_payout",
-                        "payout_id": order_id,
-                        "access_key": access_key,
-                    }
-                    _dump_take_request(cfg, order_id, data, response, server_reply, predicted)
+                    # Состав тела — по конфигу площадки (имена полей/act), а не
+                    # захардкоженные: для SPA тело может быть пустым (id в URL).
+                    data = client._take_payload(order_id, csrf_token, access_key)
+                    _dump_take_request(
+                        cfg,
+                        order_id,
+                        data,
+                        response,
+                        server_reply,
+                        predicted,
+                        url=client.take_url(order_id),
+                    )
                 except Exception:
                     logger.exception("Не удалось сохранить дамп запроса для #%s", order_id)
 
@@ -837,7 +1243,7 @@ async def demands_loop(client: PayoutClient, cfg: Config, ws: WorkerState, notif
             return
         if rows is not None:
             statuses = {r["id"]: r.get("status", "") for r in rows if r.get("id")}
-            in_work = in_work_ids(rows)
+            in_work = in_work_ids(rows, cfg)
             stale = ws.demands_ids
             ws.demands_ids = in_work
             # Заявки, которые были в работе, а теперь нет — их слот освободился.
@@ -880,7 +1286,7 @@ async def watch_loop(
         await notify("⚠️ Сессия слетела. Останавливаю наблюдение. Запусти кабинет заново (/run).")
         return
     if rows is not None:
-        ws.demands_ids = in_work_ids(rows)
+        ws.demands_ids = in_work_ids(rows, cfg)
         ws.taken_order_ids.intersection_update(ws.demands_ids)
         if cfg.debug:
             await notify(
@@ -916,7 +1322,7 @@ async def watch_loop(
             continue
         t_recv = time.perf_counter()
 
-        rows = parse_rows(html)
+        rows = parse_rows(html, cfg)
         t_parsed = time.perf_counter()
         ids = {r["id"] for r in rows}
         new_ids = ids - prev_ids
@@ -988,7 +1394,9 @@ def _fire_predicted_window(
     список запущенных задач, чтобы можно было дождаться их результата.
     """
     csrf = ws.last_csrf_token
-    if not csrf or ws.last_order_id <= 0:
+    # csrf обязателен только там, где он есть в разметке (TAKE_REQUIRES_CSRF).
+    # Для SPA предсказатель работает и без него.
+    if ws.last_order_id <= 0 or (cfg.take_requires_csrf and not csrf):
         return []
     start = ws.last_order_id
     tasks = []
@@ -1065,7 +1473,11 @@ async def predict_loop(
     # иначе в чат летело бы одно и то же сообщение и выглядело как дубли.
     notified_anchor: int | None = None
     while ws.running and ws.mode == "take":
-        if not cfg.predictive_take or ws.last_order_id <= 0 or not ws.last_csrf_token:
+        if (
+            not cfg.predictive_take
+            or ws.last_order_id <= 0
+            or (cfg.take_requires_csrf and not ws.last_csrf_token)
+        ):
             await asyncio.sleep(0.2)
             continue
 
@@ -1178,7 +1590,7 @@ async def _poll_loop(
             await asyncio.sleep(1)
             continue
         t_recv = time.perf_counter()
-        rows = parse_rows(html)
+        rows = parse_rows(html, cfg)
         t_parsed = time.perf_counter()
 
         timing = {
@@ -1204,7 +1616,14 @@ async def _poll_loop(
                 if r["id"] not in inflight
                 and r["id"] not in ws.demands_ids
                 and r["id"] not in ws.taken_order_ids
-                and r.get("csrf_token")
+                # csrf нужен только там, где он вообще есть в разметке
+                # (TAKE_REQUIRES_CSRF=true). Для SPA-площадок токена в HTML нет.
+                and (r.get("csrf_token") or not cfg.take_requires_csrf)
+                # Берём только реально доступные заявки. На серверных формах
+                # очередь и так содержит только их (фильтр ничего не меняет),
+                # а SPA-таблица показывает все статусы — без фильтра бот пытался
+                # бы «взять» заявки, которые уже в работе или завершены.
+                and _is_available_status(r.get("status"), cfg)
             ),
             None,
         )
@@ -1238,7 +1657,7 @@ async def resync_demands_loop(client: PayoutClient, cfg: Config, ws: WorkerState
         except SessionExpired:
             return  # сессию чинит run_worker (start_session/ensure_session)
         if rows is not None:
-            ws.demands_ids = in_work_ids(rows)
+            ws.demands_ids = in_work_ids(rows, cfg)
             # Стираем «мёртвые» id из памяти вместе со сверкой — это и есть
             # лечение накопленного кэша (бот писал «в работе 10», реально 1).
             ws.taken_order_ids.intersection_update(ws.demands_ids)
@@ -1313,7 +1732,7 @@ async def take_loop(
         # старые id из ОПЕРАТИВНОЙ памяти (taken_order_ids), которых больше нет
         # на demands, выкидываем — без этого после перезапусков «мёртвые» заявки
         # копятся и бот пишет «в работе 10» при реальной 1.
-        in_work = in_work_ids(rows)
+        in_work = in_work_ids(rows, cfg)
         stale_taken = taken_before - in_work
         if stale_taken and cfg.debug:
             await notify(

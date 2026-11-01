@@ -86,27 +86,75 @@ def _on_polling_error(exc: Exception) -> None:
     logger.error("Ошибка при опросе Telegram: %s: %s", type(exc).__name__, exc)
 
 
+def _shadowed_env(env_file: Path) -> dict:
+    """Ключи, заданные И в .env, И в окружении — с РАЗНЫМИ значениями.
+
+    `load_dotenv()` по умолчанию не перезаписывает уже существующие переменные,
+    поэтому старый `export TARGET_QUEUE_SIZE=10` в терминале тихо подменяет
+    значение из .env. Возвращает {ключ: (значение_окружения, значение_файла)}.
+    """
+    try:
+        from dotenv import dotenv_values
+
+        from_file = {k: v for k, v in dotenv_values(env_file).items() if v is not None}
+    except Exception:
+        return {}
+    return {
+        key: (os.environ[key], value)
+        for key, value in from_file.items()
+        if key in os.environ and os.environ[key] != value
+    }
+
+
+def _warn_shadowed_env(env_file: Path | None = None) -> None:
+    """Громко предупреждает, что терминал перекрывает .env.
+
+    Иначе это выглядит как «в .env написано 8, а бот пишет цель 10». Секреты
+    (токены/пароли/логины) не печатаем — только факт расхождения.
+    """
+    env_file = env_file or (Path(__file__).resolve().parents[1] / ".env")
+    shadowed = _shadowed_env(env_file)
+    if not shadowed:
+        return
+    logger.warning(
+        "Переменные окружения перекрывают .env (%d шт.): load_dotenv() их не "
+        "перезаписывает, бот возьмёт значения из терминала. Выполните `unset …` "
+        "или запустите в чистом терминале:",
+        len(shadowed),
+    )
+    for key, (shell_value, file_value) in sorted(shadowed.items()):
+        if any(word in key for word in ("TOKEN", "PASSWORD", "SECRET", "LOGIN")):
+            logger.warning("  %s: значения разные (скрыты)", key)
+        else:
+            logger.warning("  %s: в окружении %r, в .env %r", key, shell_value, file_value)
+
+
 def _run_self_check() -> int:
     """`python app/main.py --check` — проверить импорты и конфиг БЕЗ запуска бота.
 
     Полезно, когда сервис «не стартует»: команда показывает, читается ли .env,
     сколько кабинетов и админов распознано, и не требует сети/Telegram.
     """
+    _warn_shadowed_env()
     cfg = load_config()
     run_worker, backend = _pick_worker()
     logger.info(
-        "Проверка OK: backend=%s, кабинетов=%d (%s), админов=%d, прокси=%d",
+        "Проверка OK: backend=%s, кабинетов=%d (%s), админов=%d, прокси=%d, "
+        "цель=%d заявок, headless=%s",
         backend,
         len(cfg.accounts),
         ", ".join(f"{a.index}:{a.name}" for a in cfg.accounts),
         len(cfg.allowed_chat_ids),
         len(getattr(cfg, "proxy_urls", []) or []),
+        cfg.target_queue_size,
+        cfg.headless,
     )
     logger.info("Точка входа: %s", getattr(run_worker, "__module__", run_worker))
     return 0
 
 
 async def main():
+    _warn_shadowed_env()
     cfg = load_config()
     run_worker, backend = _pick_worker()
     application = build_bot_app(cfg)

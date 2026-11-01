@@ -108,10 +108,85 @@ python -m app.main
   который запустил бот, нажмите F12 → Inspect на карточке заявки и кнопке
   «взять», и пришлите мне HTML этих элементов — я подставлю селекторы.
 
+### Живой захват запроса взятия: `take_capture`
+
+Пока API взятия у площадки неизвестен (SPA шлёт JSON через fetch), HTTP-цикл
+не может взять заявку. В этом режиме работает отдельный инструмент — он держит
+браузер **видимым** (в отличие от разовой авторизации, которая окно закрывает),
+сам обновляет страницу и жмёт кнопку взятия, а заодно записывает реальный
+запрос и ответ сервера:
+
+```bash
+# 1. сначала остановите бота в Telegram (/stop), чтобы не конкурировать
+# 2. видимое окно: автообновление 3с, взять 1 заявку и снять запрос/ответ
+python -m app.take_capture
+
+# непрерывно брать кликом (страховочный режим, пока нет HTTP-API)
+python -m app.take_capture --max-takes 0
+
+# только смотреть/обновлять, ничего не нажимая
+python -m app.take_capture --no-click
+```
+
+Что делает:
+- открывает Chromium с уже сохранённой сессией (`./data/auth.json`); если
+  сессия протухла — пишет об этом и ждёт, пока вы войдёте **вручную в том же
+  окне** (`--login-wait`, по умолчанию 300 c), затем сохраняет cookies;
+- раз в `--refresh` секунд перезагружает страницу очереди;
+- ищет кнопку по тексту («Взять», «Забрать», `PAYOUT_TAKE_BUTTON_MARKERS`,
+  `--button-text`) и кликает первую видимую и включённую;
+- перехватывает сетевые запросы/ответы (URL, метод, заголовки, тело, статус)
+  и складывает их в `./data/take_capture/take_<id>_<ts>.json` (+HTML и PNG);
+- печатает готовые строки `.env` (`TAKE_API_URL_TEMPLATE`, `TAKE_PAYLOAD_FORMAT`,
+  `TAKE_ID_FIELD`, `TAKE_REQUIRES_CSRF`) и `curl` для проверки.
+
+Дальше эти значения переносятся в `.env`, и бот возвращается на
+`WORKER_BACKEND=http` — уже без окна.
+
 ## 7. Горячий цикл на HTTP (по умолчанию) и замеры времени
 Опрос очереди и взятие заявок работают на `httpx` — без браузера. Браузер
 поднимается только для разовой авторизации, если сессия в `./data/auth.json`
 перестала действовать. Переключение обратно на браузерный воркер — `WORKER_BACKEND=browser` в `.env`.
+
+### Профиль 911pay (headless: заявки берутся без браузера)
+
+Очередь площадки — Laravel + Inertia: строки лежат в JSON `props.payouts.data`,
+id заявки — `uuid`, статус — код (`unassigned`, `pending`, `wait_admin`,
+`returned_to_trader`, `success`, `canceled`, `expired`), а взятие — `POST
+/trader/payouts/{uuid}/claim` **без тела** с csrf в заголовке `X-XSRF-TOKEN`
+(значение cookie `XSRF-TOKEN`, URL-decode). Рабочий набор в `.env`:
+
+```dotenv
+WORKER_BACKEND=http
+HEADLESS=true              # окно нужно только для разовой авторизации
+PREDICTIVE_TAKE=false      # превентивное взятие выключено
+
+TAKE_API_URL_TEMPLATE=https://911pay.net/trader/payouts/{id}/claim
+TAKE_PAYLOAD_FORMAT=none   # POST без тела: id уже в URL
+TAKE_REQUIRES_CSRF=false
+TAKE_CSRF_HEADER=X-XSRF-TOKEN
+TAKE_CSRF_COOKIE=XSRF-TOKEN
+TAKE_GONE_MARKERS=срок выплаты истёк
+TAKE_RETRY_COUNT=0         # не дублировать POST (успешный ответ ещё не изучен)
+
+QUEUE_JSON_ID_FIELD=uuid
+QUEUE_JSON_STATUS_FIELD=status
+CONFIRM_REQUIRES_IN_WORK=true
+DEMANDS_URL=https://911pay.net/trader/payouts/payout-list?page=1&per_page=50&tab=in-work
+```
+
+`parse_rows()` сам распознаёт Inertia JSON/`data-page` и переводит код статуса в
+текст, поэтому `STATUS_*_MARKERS` продолжают работать. `tab=in-work` для
+`DEMANDS_URL` — это ровно занятые слоты (маленькая страница), `tab=common`
+отдаёт все 70+ заявок (сотни КБ). Подтверждение при `CONFIRM_REQUIRES_IN_WORK=true`
+идёт только по статусу «в работе»: отменённая/истёкшая заявка не считается взятой.
+
+⚠️ **Проверьте окружение терминала.** `load_dotenv()` НЕ перезаписывает уже
+экспортированные переменные, поэтому старые `TARGET_QUEUE_SIZE`/`DEMANDS_URL`/
+`HEADLESS` из прошлых запусков могут «перебить» `.env` (симптом: «в `.env` 8,
+а бот пишет цель 10»). Теперь бот при старте сам пишет WARNING со списком таких
+переменных, а `python -m app.main --check` показывает итоговые `цель=N заявок,
+headless=…`. Помогает новый терминал или `unset TARGET_QUEUE_SIZE DEMANDS_URL HEADLESS`.
 
 Важные настройки скорости (в `.env`):
 - `TAKE_POLL_MIN_MS`/`TAKE_POLL_MAX_MS` — пауза между опросами очереди, когда заявок

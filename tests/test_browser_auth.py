@@ -21,7 +21,15 @@ from app.browser_worker import (
     SEL_2FA_SUBMIT,
     SEL_LOGIN_INPUT,
     SEL_LOGIN_SUBMIT,
+    SEL_SPA_2FA_INPUT,
+    SEL_SPA_EMAIL_INPUT,
+    SEL_SPA_NEXT_BUTTON,
+    SEL_SPA_PASSWORD_INPUT,
+    SEL_SPA_SUBMIT_BUTTON,
+    _blur_active,
+    _click_next_step,
     _click_turnstile,
+    _fill_login_credentials,
     _is_challenge_page,
     _is_turnstile_frame_url,
     _looks_like_cabinet,
@@ -47,6 +55,27 @@ LOGIN_HTML = (
 TWOFA_HTML = (
     "<html><body><form id='form_tg'><input name='code'>"
     "<button class='auth-submit'>OK</button></form></body></html>"
+)
+# Новый 3-шаговый SPA-вход (Vue): поля размечены id, класса auth-form нет,
+# кнопки — текстом («Далее» / «Войти»). Шаг 1 — только email.
+SPA_LOGIN_HTML = (
+    "<html><body><div class='w-full sm:max-w-md'>"
+    "<form><input id='email' name='email' type='email' placeholder='Ваша почта'>"
+    "<button type='submit'><span>Далее</span></button></form></div></body></html>"
+)
+# Шаг 2 — пароль и «Запомнить меня» (на одной странице с email бывает только
+# у старой серверной формы; здесь отдельный шаг).
+SPA_PASSWORD_HTML = (
+    "<html><body><div class='w-full sm:max-w-md'>"
+    "<form><input id='password' name='password' type='password'>"
+    "<label><input type='checkbox' name='remember'>Запомнить меня</label>"
+    "<button type='submit'><span>Войти</span></button></form></div></body></html>"
+)
+# Шаг 3 — код 2FA.
+SPA_TWOFA_HTML = (
+    "<html><body><div class='w-full sm:max-w-md'>"
+    "<form><input id='twofa-code' name='code' type='text' placeholder='000000'>"
+    "<button type='submit'><span>Войти</span></button></form></div></body></html>"
 )
 CABINET_HTML = (
     "<html><body><div class='payout-card'>"
@@ -88,6 +117,22 @@ class Collector:
         self.files.append((path, caption))
 
 
+class _VisibilityStub:
+    """Элемент с is_visible(), как у настоящего Playwright.
+
+    Нужен, чтобы отличить «поля нет в разметке» от «поле есть, но скрыто».
+    Второй случай — реальная разметка SPA: оба шага отрисованы сразу, неактивный
+    спрятан через display:none. Раньше проверка по наличию в DOM считала такой
+    шаг активным, бот пропускал «Далее» и падал на заполнении скрытого поля.
+    """
+
+    def __init__(self, visible_fn):
+        self._visible_fn = visible_fn
+
+    async def is_visible(self) -> bool:
+        return bool(self._visible_fn())
+
+
 class FakePage:
     """Минимальный Playwright-Page для ensure_logged_in (только используемые методы)."""
 
@@ -103,6 +148,12 @@ class FakePage:
         self.form_present = True
         self.show_2fa_after_login = False
         self.form_timeout = False          # форма так и не появляется
+        # Новый 3-шаговый SPA-вход: email -> «Далее» -> password -> «Войти».
+        self.spa_login = False
+        self.spa_password_visible = False
+        # Реальная разметка 911pay: ОБА шага уже в DOM, пароль скрыт через
+        # display:none. Наличие поля в разметке НЕ значит, что шаг активен.
+        self.spa_password_in_dom = False
         self.goto_log = []
         self.fill_log = []
         self.click_log = []
@@ -132,18 +183,42 @@ class FakePage:
         return None
 
     async def wait_for_selector(self, selector, timeout=None):
-        if selector == SEL_LOGIN_INPUT:
+        # Старая серверная форма.
+        if selector == SEL_LOGIN_INPUT and not self.spa_login:
             if self.form_timeout or not self.form_present:
                 raise TimeoutError("login form not found")
             return SimpleNamespace()
-        if self.show_2fa_after_login and selector == SEL_2FA_INPUT:
+        # Новый SPA-вход: шаг email и шаг пароля.
+        if self.spa_login and selector == SEL_SPA_EMAIL_INPUT:
+            if self.form_timeout or not self.form_present:
+                raise TimeoutError("spa login form not found")
+            return SimpleNamespace()
+        if self.spa_login and selector == SEL_SPA_PASSWORD_INPUT:
+            if not self.spa_password_visible:
+                raise TimeoutError("spa password step not shown")
+            return SimpleNamespace()
+        if self.show_2fa_after_login and selector in (SEL_2FA_INPUT, SEL_SPA_2FA_INPUT):
             return SimpleNamespace()
         raise TimeoutError(f"selector {selector} not found")
 
     async def query_selector(self, selector):
-        if selector == SEL_2FA_INPUT and self.show_2fa_after_login:
+        if self.show_2fa_after_login and selector in (SEL_2FA_INPUT, SEL_SPA_2FA_INPUT):
             return SimpleNamespace()
-        if selector == SEL_LOGIN_INPUT:
+        # Новый SPA-вход: email виден сразу, пароль — только после «Далее».
+        if self.spa_login and selector == SEL_SPA_EMAIL_INPUT:
+            if self.form_present and not self.form_timeout:
+                return SimpleNamespace()
+            return None
+        if self.spa_login and selector == SEL_SPA_PASSWORD_INPUT:
+            # Реальная разметка 911pay: поле пароля отрисовано сразу, но скрыто
+            # через display:none до нажатия «Далее». Флаг spa_password_in_dom
+            # включает этот режим — элемент ЕСТЬ, но is_visible() = False.
+            if self.spa_password_in_dom:
+                return _VisibilityStub(lambda: self.spa_password_visible)
+            if self.spa_password_visible:
+                return SimpleNamespace()
+        # Старая серверная форма.
+        if selector == SEL_LOGIN_INPUT and not self.spa_login:
             if self.login_visible_hook:
                 return SimpleNamespace() if await self.login_visible_hook() else None
             if self.form_present and not self.form_timeout:
@@ -157,6 +232,20 @@ class FakePage:
 
     async def click(self, selector, timeout=None):
         self.click_log.append(selector)
+        # Новый SPA: «Далее» открывает шаг пароля.
+        if selector == SEL_SPA_NEXT_BUTTON and self.spa_login:
+            self.spa_password_visible = True
+            return None
+        # Новый SPA: «Войти» — submit шага пароля ИЛИ шага кода. Какой именно,
+        # понятно по флагу show_2fa_after_login: после шага пароля тест включает
+        # его, и следующий клик «Войти» отправляет код.
+        if selector == SEL_SPA_SUBMIT_BUTTON:
+            if self.show_2fa_after_login:
+                if self.after_2fa_handler:
+                    await self.after_2fa_handler()
+            elif self.after_login_handler:
+                await self.after_login_handler()
+            return None
         if selector == SEL_LOGIN_SUBMIT and self.after_login_handler:
             await self.after_login_handler()
         if selector == SEL_2FA_SUBMIT and self.after_2fa_handler:
@@ -233,6 +322,12 @@ class PageLooksTest(unittest.TestCase):
         self.assertTrue(_looks_like_login_form(LOGIN_HTML))
         self.assertTrue(_looks_like_login_form("<input name='pass'>"))
 
+    def test_spa_login_form_detected_by_id_markers(self):
+        """Новый 3-шаговый SPA-вход размечен id и не имеет класса auth-form."""
+        self.assertTrue(_looks_like_login_form(SPA_LOGIN_HTML))
+        self.assertTrue(_looks_like_login_form(SPA_PASSWORD_HTML))
+        self.assertTrue(_looks_like_login_form(SPA_TWOFA_HTML))
+
     def test_cabinet_detected_from_payout_rows(self):
         self.assertTrue(_looks_like_cabinet(CABINET_HTML))
 
@@ -241,6 +336,22 @@ class PageLooksTest(unittest.TestCase):
         self.assertTrue(_looks_like_cabinet(DASHBOARD_HTML))
         # …и при этом не путается с формой входа.
         self.assertFalse(_looks_like_login_form(DASHBOARD_HTML))
+
+    def test_spa_payouts_compact_counts_as_cabinet(self):
+        """Реальная SPA-таблица 911pay: <table class="w-full payouts-compact">.
+
+        Старые маркеры (payout-table/payout-card/payout-status) в ней не
+        встречаются, поэтому успешный вход ошибочно считался «неожиданной
+        разметкой» (дамп debug_after_login_unexpected_*, внутри PayOut - 911pay).
+        """
+        html = '<div id="app"><table class="w-full payouts-compact"><tbody></tbody></table></div>'
+        self.assertTrue(_looks_like_cabinet(html))
+        self.assertFalse(_looks_like_login_form(html))
+
+    def test_platform_queue_markers_from_config(self):
+        """Маркеры площадки из QUEUE_PAGE_MARKERS тоже означают «мы в кабинете»."""
+        cfg = SimpleNamespace(queue_page_markers=("custom-queue",))
+        self.assertTrue(_looks_like_cabinet("<div class='custom-queue'>", cfg))
 
     def test_captcha_is_neither_cabinet_nor_login_form(self):
         self.assertFalse(_looks_like_cabinet(CAPTCHA_HTML))
@@ -541,6 +652,105 @@ class EnsureLoggedInTest(unittest.TestCase):
         self.assertEqual(context.storage_calls, [STORAGE_PATH])
         self.assertTrue(any("Введите код 2FA" in m for m in col.messages))
 
+    def test_spa_3step_login_without_2fa(self):
+        """Новый SPA-вход: Email -> «Далее» -> Password -> «Войти» (без 2FA).
+
+        Шаги сменяют друг друга на одной странице, поля размечены id, кнопки —
+        текстом. Бот должен пройти оба шага и сохранить сессию.
+        """
+        page, context, cfg, account, ws, col = make_world()
+        page.spa_login = True
+
+        async def goto_handler(url):
+            page._url = SITE_URL
+            page._html = SPA_LOGIN_HTML
+
+        async def after_login():
+            page._url = QUEUE_URL
+            page._html = CABINET_HTML
+
+        page.goto_handler = goto_handler
+        page.after_login_handler = after_login
+        ok = asyncio.run(ensure_logged_in(page, context, cfg, account, ws, col.notify, col.notify_file))
+        self.assertTrue(ok)
+        self.assertTrue(ws.logged_in)
+        self.assertEqual(context.storage_calls, [STORAGE_PATH])
+        # Оба шага действительно заполнены, кнопки нажаты.
+        self.assertIn((SEL_SPA_EMAIL_INPUT, "a@b.c"), page.fill_log)
+        self.assertIn((SEL_SPA_PASSWORD_INPUT, "p"), page.fill_log)
+        self.assertIn(SEL_SPA_NEXT_BUTTON, page.click_log)
+        self.assertIn(SEL_SPA_SUBMIT_BUTTON, page.click_log)
+        # Старую форму не трогали.
+        self.assertNotIn(SEL_LOGIN_SUBMIT, page.click_log)
+
+    def test_spa_password_in_dom_but_hidden_still_clicks_next(self):
+        """Регрессия: поле пароля ЕСТЬ в разметке, но скрыто (display:none).
+
+        Реальная страница 911pay держит оба шага в DOM одновременно и прячет
+        неактивный. Проверка по наличию поля (#password существует) считала шаг
+        пароля активным, бот пропускал «Далее» и падал по таймауту на заполнении
+        скрытого поля — браузер закрывался. Теперь смотрим ВИДИМОСТЬ.
+        """
+        page, context, cfg, account, ws, col = make_world()
+        page.spa_login = True
+        # Ключевое отличие от обычного SPA-теста: поле пароля уже в DOM,
+        # но невидимо — как на настоящем сайте.
+        page.spa_password_in_dom = True
+        page.spa_password_visible = False
+
+        async def goto_handler(url):
+            page._url = SITE_URL
+            page._html = SPA_LOGIN_HTML
+
+        async def after_login():
+            page._url = QUEUE_URL
+            page._html = CABINET_HTML
+
+        page.goto_handler = goto_handler
+        page.after_login_handler = after_login
+        ok = asyncio.run(ensure_logged_in(page, context, cfg, account, ws, col.notify, col.notify_file))
+        self.assertTrue(ok)
+        self.assertTrue(ws.logged_in)
+        # Главное: «Далее» нажата, несмотря на то что #password был в разметке.
+        self.assertIn(SEL_SPA_NEXT_BUTTON, page.click_log)
+        self.assertIn((SEL_SPA_EMAIL_INPUT, "a@b.c"), page.fill_log)
+        self.assertIn((SEL_SPA_PASSWORD_INPUT, "p"), page.fill_log)
+        self.assertIn(SEL_SPA_SUBMIT_BUTTON, page.click_log)
+
+    def test_spa_3step_login_with_2fa(self):
+        """Новый SPA-вход + 2FA: код вводится в #twofa-code, затем «Войти».
+
+        После шага пароля SPA остаётся на том же роуте (/signin) и показывает шаг
+        кода. Раньше ожидание 2FA опиралось только на URL и пропускало этот шаг —
+        теперь поле кода проверяется до URL.
+        """
+        page, context, cfg, account, ws, col = make_world()
+        page.spa_login = True
+        ws.submit_2fa_code("123456")  # заранее кладём код в очередь
+
+        async def goto_handler(url):
+            page._url = SITE_URL
+            page._html = SPA_LOGIN_HTML
+
+        async def after_login():
+            page._url = SITE_URL  # остаёмся на /signin, показан шаг кода
+            page._html = SPA_TWOFA_HTML
+            page.show_2fa_after_login = True
+
+        async def after_2fa():
+            page._url = QUEUE_URL
+            page._html = CABINET_HTML
+
+        page.goto_handler = goto_handler
+        page.after_login_handler = after_login
+        page.after_2fa_handler = after_2fa
+        ok = asyncio.run(ensure_logged_in(page, context, cfg, account, ws, col.notify, col.notify_file))
+        self.assertTrue(ok)
+        self.assertTrue(ws.logged_in)
+        self.assertEqual(context.storage_calls, [STORAGE_PATH])
+        self.assertTrue(any("Введите код 2FA" in m for m in col.messages))
+        self.assertIn((SEL_SPA_2FA_INPUT, "123456"), page.fill_log)
+
 
 class _FakeLocator:
     """Локатор-заглушка: «видимый/невидимый», клики пишет в общий список."""
@@ -708,6 +918,161 @@ class DebugDumpTest(unittest.TestCase):
         self.assertTrue(col.messages)
         self.assertEqual(len(col.files), 2)  # HTML + PNG
         self.assertTrue(saved)
+
+
+class _ActionPage:
+    """Мини-страница с evaluate/press: проверяет фолбэки «Далее» и снятие фокуса.
+
+    FakePage этих методов не имеет (getattr → None), поэтому ветки, ради которых
+    делались фиксы входа, в прежних тестах молча пропускались. Здесь пишем все
+    вызовы, чтобы проверить порядок действий и что ни один фолбэк не роняет вход.
+    """
+
+    def __init__(self, click_fails=False, press_fails=False, eval_fails=False,
+                 click_ok_after_unlock=False):
+        self.events = []
+        self.click_fails = click_fails
+        self.press_fails = press_fails
+        self.eval_fails = eval_fails
+        # «Далее» disabled, пока evaluate не снимет атрибут disabled в DOM.
+        self.click_ok_after_unlock = click_ok_after_unlock
+        self.unlocked = False
+
+    async def evaluate(self, script, *args):
+        self.events.append(("evaluate", script, args))
+        if self.eval_fails:
+            raise RuntimeError("evaluate failed")
+        if "removeAttribute" in script:
+            self.unlocked = True
+
+    async def press(self, selector, key):
+        self.events.append(("press", selector, key))
+        if self.press_fails:
+            raise RuntimeError("press failed")
+
+    async def click(self, selector, timeout=None):
+        self.events.append(("click", selector, timeout))
+        if self.click_fails and not (self.click_ok_after_unlock and self.unlocked):
+            raise TimeoutError("element is not enabled")
+
+
+class _DisabledUntilBlurPage(FakePage):
+    """«Далее» disabled, пока поле email не потеряло фокус — поведение Vue на 911pay.
+
+    Без `_blur_active` клик падал бы по таймауту: ровно тот симптом, с которым
+    пришёл пользователь («поле заполнилось, кнопка не нажалась, браузер закрылся»).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.blurred = False
+        self.eval_log = []
+
+    async def evaluate(self, script, *args):
+        self.eval_log.append(script)
+        if "blur" in script:
+            self.blurred = True
+
+    async def press(self, selector, key):
+        # Enter в поле email отправляет ту же форму, что и кнопка type="submit".
+        if selector == SEL_SPA_EMAIL_INPUT and key == "Enter":
+            self.blurred = True
+
+    async def click(self, selector, timeout=None):
+        if selector == SEL_SPA_NEXT_BUTTON and not self.blurred:
+            # Playwright ждёт actionability (снятия disabled) и падает по таймауту.
+            raise TimeoutError("element is not enabled")
+        await super().click(selector, timeout)
+
+
+class SpaNextStepTest(unittest.TestCase):
+    """Кнопка «Далее» включается по blur, а не по input — проверяем фолбэки.
+
+    Симптом с прода: `page.fill()` заполняет email, но не шлёт blur, Vue не снимает
+    disabled, Playwright ждёт actionability до таймаута — клика нет, браузер
+    закрывается. Фикс: снять фокус, кликнуть с коротким таймаутом, затем Enter,
+    затем снять disabled в DOM.
+    """
+
+    def test_blur_active_blurs_focused_element(self):
+        page = _ActionPage()
+        asyncio.run(_blur_active(page))
+        self.assertEqual([e[0] for e in page.events], ["evaluate"])
+        self.assertIn("blur", page.events[0][1])
+
+    def test_blur_active_is_noop_without_evaluate_or_press(self):
+        # У FakePage нет evaluate/press — вход не должен падать.
+        asyncio.run(_blur_active(FakePage()))
+
+    def test_blur_active_falls_back_to_tab_when_evaluate_fails(self):
+        page = _ActionPage(eval_fails=True)
+        asyncio.run(_blur_active(page))
+        self.assertEqual([e[0] for e in page.events], ["evaluate", "press"])
+        self.assertEqual(page.events[1][2], "Tab")
+
+    def test_click_next_blurs_first_then_clicks(self):
+        page = _ActionPage()
+        asyncio.run(_click_next_step(page, SEL_SPA_EMAIL_INPUT, SEL_SPA_NEXT_BUTTON))
+        self.assertEqual([e[0] for e in page.events], ["evaluate", "click"])
+        self.assertIn("blur", page.events[0][1])
+        self.assertEqual(page.events[1][1], SEL_SPA_NEXT_BUTTON)
+        # Короткий таймаут: не ждём 15 с на заведомо выключенной кнопке.
+        self.assertEqual(page.events[1][2], 5000)
+
+    def test_click_next_falls_back_to_enter(self):
+        page = _ActionPage(click_fails=True)
+        asyncio.run(_click_next_step(page, SEL_SPA_EMAIL_INPUT, SEL_SPA_NEXT_BUTTON))
+        self.assertEqual([e[0] for e in page.events], ["evaluate", "click", "press"])
+        self.assertEqual(page.events[2][1], SEL_SPA_EMAIL_INPUT)
+        self.assertEqual(page.events[2][2], "Enter")
+
+    def test_click_next_removes_disabled_when_enter_also_fails(self):
+        page = _ActionPage(
+            click_fails=True, press_fails=True, click_ok_after_unlock=True
+        )
+        asyncio.run(_click_next_step(page, SEL_SPA_EMAIL_INPUT, SEL_SPA_NEXT_BUTTON))
+        self.assertEqual(
+            [e[0] for e in page.events],
+            ["evaluate", "click", "press", "evaluate", "click"],
+        )
+        # Последний клик прошёл только после снятия disabled в DOM.
+        self.assertTrue(page.unlocked)
+
+    def test_click_next_never_raises_when_every_fallback_fails(self):
+        page = _ActionPage(click_fails=True, press_fails=True, eval_fails=True)
+        # Ни клик, ни Enter, ни снятие disabled не удались — вход не падает.
+        asyncio.run(_click_next_step(page, SEL_SPA_EMAIL_INPUT, SEL_SPA_NEXT_BUTTON))
+        self.assertEqual(
+            [e[0] for e in page.events],
+            ["evaluate", "press", "click", "press", "evaluate"],
+        )
+
+    def test_login_succeeds_when_next_button_disabled_until_blur(self):
+        """Регрессия к симптому с прода: без снятия фокуса «Далее» не нажимается."""
+        page = _DisabledUntilBlurPage()
+        _, context, cfg, account, ws, col = make_world()
+        page.spa_login = True
+
+        async def goto_handler(url):
+            page._url = SITE_URL
+            page._html = SPA_LOGIN_HTML
+
+        async def after_login():
+            page._url = QUEUE_URL
+            page._html = CABINET_HTML
+
+        page.goto_handler = goto_handler
+        page.after_login_handler = after_login
+        ok = asyncio.run(
+            ensure_logged_in(page, context, cfg, account, ws, col.notify, col.notify_file)
+        )
+        self.assertTrue(ok, "вход должен пройти: _blur_active снимает disabled у «Далее»")
+        self.assertTrue(ws.logged_in)
+        # Фокус действительно снимали: без этого «Далее» осталась бы disabled.
+        self.assertTrue(any("blur" in s for s in page.eval_log))
+        self.assertTrue(page.blurred)
+        self.assertIn(SEL_SPA_NEXT_BUTTON, page.click_log)
+        self.assertIn(SEL_SPA_SUBMIT_BUTTON, page.click_log)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,17 @@ SEL_LOGIN_SUBMIT = "form.auth-form:has(input[name='pass']) button.auth-submit"
 SEL_2FA_INPUT = "#form_tg input[name='code']"
 SEL_2FA_SUBMIT = "#form_tg button.auth-submit"
 
+# --- Новый 3-шаговый SPA-вход (Email -> Password -> 2FA) ---
+# Отличие от старой серверной формы: шаги сменяют друг друга на одной странице,
+# поля размечены id (Vue-компонент), а кнопки — текстом («Далее» / «Войти»).
+# Шаг 1: email -> «Далее»; шаг 2: password -> «Войти»; шаг 3: код -> «Войти».
+# Селекторы вынесены в Config (см. app/config.py), здесь — значения по умолчанию.
+SEL_SPA_EMAIL_INPUT = "input#email"
+SEL_SPA_PASSWORD_INPUT = "input#password"
+SEL_SPA_2FA_INPUT = "input#twofa-code"
+SEL_SPA_NEXT_BUTTON = "button:has-text('Далее')"
+SEL_SPA_SUBMIT_BUTTON = "button:has-text('Войти')"
+
 # Таблица заявок на странице выплат (по присланной разметке)
 SEL_PAYOUT_CARD = ".payout-card"
 SEL_PAYOUT_ROWS = ".payout-card table.payout-table tbody tr"
@@ -66,12 +77,34 @@ UNEXPECTED_PAGE_MARKERS = (
 
 
 def _looks_like_login_form(html: str) -> bool:
-    """Привычная разметка страницы входа: форма auth-form с email/pass."""
+    """Разметка страницы входа: старая форма auth-form ИЛИ новый SPA-вход.
+
+    Старая серверная форма опознаётся по классу auth-form и полям name=email/pass.
+    Новый 3-шаговый SPA-вход (Vue) размечен id: #email, #password, #twofa-code —
+    класса auth-form там нет, поэтому без этих маркеров страница входа ошибочно
+    считалась «неожиданной разметкой» (капчей) и вход не выполнялся.
+    """
     low = (html or "").lower()
-    return any(m in low for m in ("auth-form", "name='email'", 'name="email"', "name='pass'", 'name="pass"'))
+    markers = (
+        "auth-form",
+        "name='email'",
+        'name="email"',
+        "name='pass'",
+        'name="pass"',
+        # SPA-вход: поля размечены id, класса auth-form нет. Шаги разные, поэтому
+        # маркеры для всех трёх полей: страница может открыться сразу на пароле
+        # (если email уже введён) или сразу на коде.
+        'id="email"',
+        "id='email'",
+        'id="password"',
+        "id='password'",
+        'id="twofa-code"',
+        "id='twofa-code'",
+    )
+    return any(m in low for m in markers)
 
 
-def _looks_like_cabinet(html: str) -> bool:
+def _looks_like_cabinet(html: str, cfg: Config | None = None) -> bool:
     """Привычная разметка рабочей страницы кабинета (очередь выплат/demands).
 
     Кроме таблицы выплат (payout-*) сюда входит и стартовая страница кабинета
@@ -81,12 +114,26 @@ def _looks_like_cabinet(html: str) -> bool:
     из-за чего сессия не сохранялась и горячий цикл так и не запускался.
     Маркер user-account-page не встречается на странице входа (там auth-form),
     поэтому ложных срабатываний «мы в кабинете» на форме логина не даёт.
+
+    У SPA (911pay) таблица выплат размечена классом `payouts-compact` — ни одного
+    из старых маркеров в ней нет. Без этого маркера УСПЕШНЫЙ SPA-вход считался
+    «неожиданной разметкой» (реальный дамп debug_after_login_unexpected_*.html,
+    внутри — PayOut - 911pay), сессия не сохранялась и бот шёл на повторный логин.
+    Дополнительно учитываются маркеры площадки из `cfg.queue_page_markers`.
     """
     low = (html or "").lower()
-    return any(
-        m in low
-        for m in ("payout-table", "payout-card", "payout-status", "user-account-page")
-    )
+    markers = [
+        "payout-table",
+        "payout-card",
+        "payout-status",
+        "user-account-page",
+        "payouts-compact",
+    ]
+    for marker in getattr(cfg, "queue_page_markers", ()) or ():
+        text = str(marker).lower().strip()
+        if text and text not in markers:
+            markers.append(text)
+    return any(m in low for m in markers)
 
 
 def _is_challenge_page(html: str) -> bool:
@@ -261,6 +308,176 @@ async def _click_turnstile(page: Page, notify=None) -> bool:
     return clicked
 
 
+async def _query_any(page: Page, selectors: tuple) -> str | None:
+    """Первый существующий селектор из списка (None — ни один не найден).
+
+    Нужно, чтобы одна и та же логика работала и на старой серверной форме
+    (form.auth-form), и на новом SPA-входе (поля размечены id). Ошибки обращения
+    к DOM (страница как раз перезагружается) не пробрасываем — пробуем дальше.
+    """
+    for sel in selectors:
+        try:
+            if await page.query_selector(sel):
+                return sel
+        except Exception:
+            continue
+    return None
+
+
+async def _is_visible_any(page: Page, selectors: tuple) -> str | None:
+    """Первый ВИДИМЫЙ селектор из списка (None — ни один не виден).
+
+    Важно отличать «есть в разметке» от «видно на экране». SPA-вход держит оба
+    шага в DOM одновременно и переключает их через display:none: #password
+    существует с самого начала, но скрыт. Проверка по наличию приводила к тому,
+    что бот пропускал кнопку «Далее» и падал по таймауту, пытаясь заполнить
+    невидимое поле пароля.
+    """
+    for sel in selectors:
+        try:
+            el = await page.query_selector(sel)
+            if el is None:
+                continue
+            is_vis = getattr(el, "is_visible", None)
+            # Мок-страница в тестах не умеет is_visible() — считаем её видимой,
+            # иначе проверка теряет смысл при подменённом DOM.
+            if is_vis is None or await is_vis():
+                return sel
+        except Exception:
+            continue
+    return None
+
+
+async def _blur_active(page: Page) -> None:
+    """Снимает фокус с активного поля, чтобы SPA пересчитал валидацию.
+
+    На 911pay кнопка «Далее» отрисована сразу, но с атрибутом disabled, и
+    включается только после того, как Vue проверит email — а проверка висит на
+    blur/change. ``page.fill()`` шлёт лишь input, поэтому кнопка остаётся серой:
+    Playwright ждёт actionability (снятия disabled) до таймаута, клик так и не
+    происходит, и браузер закрывается. Живой пользователь, кликая по кнопке, сам
+    снимает фокус с поля — повторяем это заранее. В мок-странице тестов нет
+    evaluate/press — просто пропускаем.
+    """
+    ev = getattr(page, "evaluate", None)
+    if ev is not None:
+        try:
+            await ev(
+                "() => { const a = document.activeElement;"
+                " if (a && typeof a.blur === 'function') a.blur(); }"
+            )
+            return
+        except Exception:
+            pass
+    press = getattr(page, "press", None)
+    if press is not None:
+        try:
+            await press("input:focus", "Tab")
+        except Exception:
+            pass
+
+
+async def _click_next_step(page: Page, email_sel: str, next_sel: str) -> None:
+    """Жмёт «Далее» на шаге email.
+
+    Кнопка бывает изначально disabled и включается только после валидации email,
+    причём валидация запускается по blur/change, а не по input. Поэтому сначала
+    снимаем фокус с поля email (``_blur_active``), затем кликаем — с коротким
+    таймаутом, чтобы не тратить 15 секунд на заведомо выключенную кнопку.
+    Если клик не прошёл — жмём Enter в поле email (кнопка type="submit" внутри
+    <form>, Enter отправляет ту же форму). Последняя попытка — снять disabled
+    в DOM и кликнуть: Vue мог не включить кнопку сам.
+    """
+    await _blur_active(page)
+    try:
+        await page.click(next_sel, timeout=5000)
+        return
+    except Exception as e:
+        logger.info("«Далее» не нажалась (%s) — пробую Enter в поле email", e)
+    press = getattr(page, "press", None)
+    if press is not None:
+        try:
+            await press(email_sel, "Enter")
+            return
+        except Exception as e:
+            logger.info("Enter в поле email не сработал (%s)", e)
+    ev = getattr(page, "evaluate", None)
+    if ev is not None:
+        try:
+            await ev(
+                "(sel) => { const b = document.querySelector(sel);"
+                " if (b) { b.removeAttribute('disabled'); b.disabled = false; } }",
+                next_sel,
+            )
+            await page.click(next_sel, timeout=5000)
+        except Exception as e:
+            logger.warning("«Далее» так и не нажалась даже после снятия disabled: %s", e)
+
+
+async def _login_form_visible(page: Page) -> bool:
+    """Форма входа уже отрисована? Старая серверная ИЛИ новый SPA-шаг с email."""
+    return bool(await _query_any(page, (SEL_LOGIN_INPUT, SEL_SPA_EMAIL_INPUT)))
+
+
+async def _fill_login_credentials(page: Page, cfg: Config, account) -> str:
+    """Вводит логин и пароль, возвращая режим входа: "form" (старая форма) или "spa".
+
+    Старая серверная форма: email и пароль отрисованы сразу — заполняем оба поля
+    и жмём submit. Новый 3-шаговый SPA-вход (Email -> Password -> 2FA): после
+    ввода email поля пароля ещё нет — жмём «Далее», дожидаемся поля пароля,
+    заполняем его и жмём «Войти».
+
+    Режим определяется по ФАКТИЧЕСКОЙ разметке (есть ли #email), поэтому код
+    одинаково работает и на старой, и на новой площадке — переезд не требует
+    правки кода, только env-селекторов при нестандартных id/текстах кнопок.
+    """
+    spa_email = getattr(cfg, "spa_email_selector", SEL_SPA_EMAIL_INPUT)
+    spa_password = getattr(cfg, "spa_password_selector", SEL_SPA_PASSWORD_INPUT)
+    spa_next = getattr(cfg, "spa_next_selector", SEL_SPA_NEXT_BUTTON)
+    spa_submit = getattr(cfg, "spa_submit_selector", SEL_SPA_SUBMIT_BUTTON)
+
+    if await _query_any(page, (spa_email,)):
+        # --- Новый SPA-вход ---
+        await page.fill(spa_email, account.login, timeout=10000)
+        # Оба шага обычно лежат в разметке одновременно (пароль скрыт через
+        # display:none), поэтому смотрим ВИДИМОСТЬ поля пароля, а не наличие:
+        # иначе «Далее» пропускается и заполнение падает на скрытом #password.
+        if not await _is_visible_any(page, (spa_password,)):
+            await _click_next_step(page, spa_email, spa_next)
+            try:
+                await page.wait_for_selector(spa_password, timeout=15000)
+            except Exception:
+                # Клик мог уйти раньше, чем Vue включил кнопку: пробуем ещё раз.
+                # Но если шаг всё-таки открылся (опоздал на границе таймаута) —
+                # повторный клик по скрытой «Далее» только всё сломает.
+                if await _is_visible_any(page, (spa_password,)):
+                    logger.info("Шаг пароля открылся на границе таймаута — идём дальше")
+                else:
+                    logger.info("Шаг пароля не открылся — повторяю нажатие «Далее»")
+                    await _click_next_step(page, spa_email, spa_next)
+                    await page.wait_for_selector(spa_password, timeout=15000)
+        await page.fill(spa_password, account.password, timeout=10000)
+        # Кнопка «Войти» тоже бывает disabled до валидации пароля по blur/change.
+        await _blur_active(page)
+        try:
+            await page.click(spa_submit, timeout=10000)
+        except Exception as e:
+            logger.info("«Войти» не нажалась (%s) — пробую Enter в поле пароля", e)
+            press = getattr(page, "press", None)
+            if press is not None:
+                try:
+                    await press(spa_password, "Enter")
+                except Exception as e2:
+                    logger.warning("«Войти» так и не нажалась: %s", e2)
+        return "spa"
+
+    # --- Старая серверная форма: email + пароль в одной форме ---
+    await page.fill(SEL_LOGIN_INPUT, account.login, timeout=10000)
+    await page.fill(SEL_PASSWORD_INPUT, account.password, timeout=10000)
+    await page.click(SEL_LOGIN_SUBMIT, timeout=10000)
+    return "form"
+
+
 async def _wait_for_login_form(page: Page, cfg: Config, notify, timeout_s: int) -> bool:
     """Ждём форму входа, пережидая Cloudflare-проверку и редиректы.
 
@@ -273,12 +490,9 @@ async def _wait_for_login_form(page: Page, cfg: Config, notify, timeout_s: int) 
     clicked_challenge = False
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        # 1. Форма уже есть?
-        try:
-            if await page.query_selector(SEL_LOGIN_INPUT):
-                return True
-        except Exception:
-            pass  # страница как раз перезагружается — смотрим в следующей итерации
+        # 1. Форма уже есть? (старая серверная ИЛИ новый SPA-шаг с email)
+        if await _login_form_visible(page):
+            return True
 
         # 2. Не Cloudflare ли сейчас? (это не ошибка, а пауза — ждём дальше)
         try:
@@ -300,12 +514,7 @@ async def _wait_for_login_form(page: Page, cfg: Config, notify, timeout_s: int) 
 
     # Последняя проверка перед тем, как признать неудачу: форма могла появиться
     # в момент, когда мы уже вышли из while.
-    try:
-        if await page.query_selector(SEL_LOGIN_INPUT):
-            return True
-    except Exception:
-        pass
-    return False
+    return await _login_form_visible(page)
 
 
 async def _wait_challenge_passed(page: Page, cfg: Config, notify, timeout_s: int = 90) -> None:
@@ -494,8 +703,16 @@ async def _build_context(pw, cfg: Config, account, proxy: str | None = None) -> 
     return browser, context
 
 
-def _on_signin(page: Page) -> bool:
-    return "/signin" in page.url
+def _on_signin(page: Page, cfg: Config | None = None) -> bool:
+    """Мы всё ещё на странице входа?
+
+    Путь берётся из конфига площадки (`SIGNIN_PATH`): у 911pay это `/login`, у
+    прежней площадки — `/signin`. Жёсткий `/signin` ломал ожидание после пароля
+    (URL `/login` считался «ушли со входа»), из-за чего бот не дожидался
+    авторизации и мог сохранить нерабочую сессию.
+    """
+    path = getattr(cfg, "signin_path", None) or "/signin"
+    return path in page.url
 
 
 async def ensure_logged_in(
@@ -513,7 +730,7 @@ async def ensure_logged_in(
     login_timeout = getattr(cfg, "login_form_timeout_s", 90)
     await page.goto(cfg.queue_url, wait_until="domcontentloaded")
     await _wait_url_settle(page)
-    if not _on_signin(page):
+    if not _on_signin(page, cfg):
         # Вне /signin — но точно ли мы в кабинете? Сайт перед /signin может сначала
         # показать Cloudflare-проверку «Один момент…» и кратковременную страницу
         # редиректа/загрузки, а форму входа «дорисовать» чуть позже. Поэтому читать
@@ -529,7 +746,7 @@ async def ensure_logged_in(
                 html = await page.content()
             except Exception:
                 html = ""
-            if _looks_like_cabinet(html):
+            if _looks_like_cabinet(html, cfg):
                 ws.logged_in = True
                 await notify("✅ Сессия активна, повторная авторизация не нужна.")
                 return True
@@ -540,7 +757,7 @@ async def ensure_logged_in(
                 # Cloudflare-проверку пережидаем, потом заново оцениваем страницу.
                 await _wait_challenge_passed(page, cfg, notify, login_timeout)
                 continue
-            if _on_signin(page):          # редирект на /signin — там форма входа
+            if _on_signin(page, cfg):     # редирект на страницу входа — там форма
                 resolved = True
                 break
             await asyncio.sleep(1)
@@ -552,11 +769,11 @@ async def ensure_logged_in(
                 html = await page.content()
             except Exception:
                 html = ""
-            if _looks_like_cabinet(html):
+            if _looks_like_cabinet(html, cfg):
                 ws.logged_in = True
                 await notify("✅ Сессия активна, повторная авторизация не нужна.")
                 return True
-            if _on_signin(page) or _looks_like_login_form(html):
+            if _on_signin(page, cfg) or _looks_like_login_form(html):
                 resolved = True
             else:
                 await _send_debug_dump(
@@ -597,9 +814,9 @@ async def ensure_logged_in(
         "🔐 Страница авторизации (HTML-дамп для проверки).",
     )
     try:
-        await page.fill(SEL_LOGIN_INPUT, account.login, timeout=10000)
-        await page.fill(SEL_PASSWORD_INPUT, account.password, timeout=10000)
-        await page.click(SEL_LOGIN_SUBMIT, timeout=10000)
+        # Старая серверная форма и новый 3-шаговый SPA-вход обслуживаются одной
+        # функцией: режим определяется по фактической разметке (есть ли #email).
+        login_mode = await _fill_login_credentials(page, cfg, account)
     except Exception as e:
         await _send_debug_dump(
             page,
@@ -611,18 +828,26 @@ async def ensure_logged_in(
         )
         return False
 
-    # Ждём: либо уйдём со /signin (без 2FA), либо появится поле кода
+    # Ждём: либо уйдём со /signin (без 2FA), либо появится поле кода.
+    # Для SPA поле 2FA проверяем ДО URL: пошаговый вход может остаться на том же
+    # адресе (или сменить роут уже без /signin) и при этом показывать шаг с кодом —
+    # иначе 2FA пропускался и вход обрывался.
     code_input = None
+    twofa_input_sel = (
+        getattr(cfg, "spa_twofa_input_selector", SEL_SPA_2FA_INPUT)
+        if login_mode == "spa"
+        else SEL_2FA_INPUT
+    )
     for _ in range(40):  # ~20 сек
         await page.wait_for_timeout(500)
-        if not _on_signin(page):
-            break
         try:
-            if await page.query_selector(SEL_2FA_INPUT):
+            if await page.query_selector(twofa_input_sel):
                 code_input = True
                 break
         except Exception:
-            continue  # страница как раз перезагружается — повторим на следующей итерации
+            pass  # страница как раз перезагружается — проверим URL и повторим
+        if not _on_signin(page, cfg):
+            break
     else:
         # Всё ещё на /signin и кода нет — вероятно, неправильный пароль или ошибка на форме.
         await _send_debug_dump(
@@ -645,7 +870,7 @@ async def ensure_logged_in(
             await notify("⏱ Код не получен за 5 минут. Отправьте /start_session заново.")
             return False
         try:
-            await page.fill(SEL_2FA_INPUT, code, timeout=10000)
+            await page.fill(twofa_input_sel, code, timeout=10000)
         except Exception as e:
             await _send_debug_dump(
                 page,
@@ -660,23 +885,29 @@ async def ensure_logged_in(
         # Сайт может сам отправить форму сразу после ввода кода ("Проверка кода...")
         # и уйти на другую страницу — тогда клик не нужен, а обращение к DOM
         # падает с "Execution context was destroyed". Это нормально, игнорируем.
+        twofa_submit_sel = (
+            getattr(cfg, "spa_submit_selector", SEL_SPA_SUBMIT_BUTTON)
+            if login_mode == "spa"
+            else SEL_2FA_SUBMIT
+        )
         try:
-            await page.click(SEL_2FA_SUBMIT, timeout=3000)
+            await page.click(twofa_submit_sel, timeout=3000)
         except Exception as e:
             logger.info("2FA submit click skipped (форма уже отправлена?): %s", e)
 
         try:
-            await page.wait_for_url(lambda u: "/signin" not in u, timeout=15000)
+            signin_path = getattr(cfg, "signin_path", None) or "/signin"
+            await page.wait_for_url(lambda u: signin_path not in u, timeout=15000)
         except Exception:
             pass
 
     # Если сайт остался на /signin, хотя код принят — сессия обычно уже создана.
     # Принудительно открываем рабочую страницу, ждём стабилизации и проверяем.
-    if _on_signin(page):
+    if _on_signin(page, cfg):
         await page.goto(cfg.queue_url, wait_until="domcontentloaded")
         await _wait_url_settle(page)
 
-    if _on_signin(page):
+    if _on_signin(page, cfg):
         await _send_debug_dump(
             page,
             cfg,
@@ -703,7 +934,7 @@ async def ensure_logged_in(
     # момент…»), сессия не сохранялась и горячий цикл так и не запускался.
     if _is_challenge_page(html):
         await _wait_challenge_passed(page, cfg, notify, login_timeout)
-        if _on_signin(page):
+        if _on_signin(page, cfg):
             await _send_debug_dump(
                 page,
                 cfg,
@@ -715,7 +946,7 @@ async def ensure_logged_in(
             )
             return False
         html = await _page_html()
-    if not _looks_like_cabinet(html) and not _looks_like_login_form(html):
+    if not _looks_like_cabinet(html, cfg) and not _looks_like_login_form(html):
         await _send_debug_dump(
             page,
             cfg,
@@ -1090,7 +1321,7 @@ async def fast_take_loop(choice_page: Page, confirm_page: Page, cfg: Config, not
             state.snapshot_requested = False
             await _send_live_snapshot(choice_page, cfg, notify, notify_file, "take")
 
-        if _on_signin(choice_page):
+        if _on_signin(choice_page, cfg):
             state.logged_in = False
             state.running = False
             await notify("⚠️ Сессия слетела во время взятия заявок. Останавливаю. Отправь /start_session.")
@@ -1248,7 +1479,7 @@ async def watch_loop(page: Page, cfg: Config, notify, notify_file):
             state.snapshot_requested = False
             await _send_live_snapshot(page, cfg, notify, notify_file, "watch")
 
-        if _on_signin(page):
+        if _on_signin(page, cfg):
             state.logged_in = False
             state.running = False
             await notify("⚠️ Сессия слетела. Останавливаю наблюдение. Отправь /start_session заново.")

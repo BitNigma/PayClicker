@@ -9,6 +9,7 @@
 """
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,6 +71,8 @@ class SelfCheckTest(unittest.TestCase):
             accounts=[SimpleNamespace(index=1, name="Кабинет 1")],
             allowed_chat_ids=[111],
             proxy_urls=["http://127.0.0.1:8080"],
+            target_queue_size=8,
+            headless=True,
         )
         with patch.object(main_module, "load_config", return_value=cfg), patch.object(
             main_module, "_pick_worker", return_value=(lambda: None, "http")
@@ -80,6 +83,58 @@ class SelfCheckTest(unittest.TestCase):
         self.assertIn("Проверка OK", text)
         self.assertIn("кабинетов=1", text)
         self.assertIn("прокси=1", text)
+
+
+class ShadowedEnvTest(unittest.TestCase):
+    """`export TARGET_QUEUE_SIZE=10` в терминале тихо перекрывает .env (8).
+
+    load_dotenv() не перезаписывает существующие переменные, поэтому бот брал
+    значение из окружения — и писал «цель 10 заявок» при TARGET_QUEUE_SIZE=8.
+    Теперь при старте выводится предупреждение со списком таких переменных.
+    """
+
+    def _env_file(self, tmp: Path, text: str) -> Path:
+        path = tmp / ".env"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_detects_value_shadowed_by_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = self._env_file(Path(tmp), "TARGET_QUEUE_SIZE=8\nHEADLESS=true\n")
+            with patch.dict(
+                main_module.os.environ, {"TARGET_QUEUE_SIZE": "10"}, clear=False
+            ):
+                shadowed = main_module._shadowed_env(env_file)
+        self.assertEqual(shadowed["TARGET_QUEUE_SIZE"], ("10", "8"))
+        self.assertNotIn("HEADLESS", shadowed)  # в окружении нет — не перекрывает
+
+    def test_same_value_is_not_shadowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = self._env_file(Path(tmp), "TARGET_QUEUE_SIZE=8\n")
+            with patch.dict(
+                main_module.os.environ, {"TARGET_QUEUE_SIZE": "8"}, clear=False
+            ):
+                self.assertEqual(main_module._shadowed_env(env_file), {})
+
+    def test_warning_lists_keys_and_masks_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = self._env_file(
+                Path(tmp), "TARGET_QUEUE_SIZE=8\nSITE_PASSWORD=fromfile\n"
+            )
+            with patch.dict(
+                main_module.os.environ,
+                {"TARGET_QUEUE_SIZE": "10", "SITE_PASSWORD": "fromshell"},
+                clear=False,
+            ), self.assertLogs("main", level="WARNING") as captured:
+                main_module._warn_shadowed_env(env_file)
+        text = "\n".join(captured.output)
+        self.assertIn("TARGET_QUEUE_SIZE", text)
+        self.assertIn("'10'", text)
+        self.assertIn("'8'", text)
+        self.assertIn("SITE_PASSWORD", text)
+        self.assertIn("скрыты", text)
+        self.assertNotIn("fromshell", text)
+        self.assertNotIn("fromfile", text)
 
 
 class DirectScriptRunTest(unittest.TestCase):

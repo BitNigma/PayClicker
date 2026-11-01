@@ -114,6 +114,66 @@ class Config:
     take_success_markers: tuple = ()
     take_gone_markers: tuple = ()
 
+    # --- Профиль площадки: разметка HTML и эндпоинт взятия ---
+    # Значения по умолчанию = текущая площадка (spark-trading.cash): серверные
+    # формы с csrf_token. Другая площадка задаётся через env (см.
+    # .env.platform2.example) — код при этом не меняется.
+    site_host: str = "spark-trading.cash"
+    signin_path: str = "/signin"
+    # Любой из маркеров в <tr> делает строку строкой заявки.
+    payout_row_markers: tuple = ("payout-status", "payout-table")
+    # Маркеры кнопки/формы взятия внутри строки (для SPA — класс кнопки).
+    payout_take_button_markers: tuple = ("take_payout",)
+    # Тексты статусов: заявка доступна / в работе / завершена.
+    status_available_markers: tuple = ("ждет провайдера", "не назначено")
+    status_in_work_markers: tuple = ("в работе у провайдера", "в работе")
+    status_done_markers: tuple = ("выполнена", "выполнено", "завершена")
+    # Строка-заглушка «заявок нет».
+    empty_row_text: str = "не найдено"
+    # Регулярка для id из текста строки, когда формы нет (по умолчанию «# 123»).
+    row_id_text_pattern: str = r"#\s*(\d+)"
+    # Брать id из первой ячейки <td>, если ни скрытого поля, ни «# 123» в строке нет.
+    # Нужно для SPA-площадок: там id лежит обычным текстом в первой колонке.
+    row_id_from_first_cell: bool = False
+    # POST взятия: шаблон URL ({id} подставляется; пусто — POST на QUEUE_URL),
+    # формат тела (form|json) и имена полей.
+    take_api_url_template: str = ""
+    take_payload_format: str = "form"
+    take_id_field: str = "payout_id"
+    take_csrf_field: str = "csrf_token"
+    take_access_key_field: str = "access_key"
+    take_act_field: str = "act"
+    take_act_value: str = "take_payout"
+    # SPA/JSON-площадки: csrf приходит НЕ скрытым полем в HTML, а заголовком.
+    # Laravel отдаёт cookie XSRF-TOKEN (URL-encoded) → заголовок X-XSRF-TOKEN
+    # (значение декодируется). Пусто — заголовок не отправляется.
+    take_csrf_header: str = ""
+    take_csrf_cookie: str = ""
+    # SPA на Inertia: очередь приходит JSON'ом (props.payouts.data), id заявки —
+    # uuid, статус — код (unassigned/pending/success/…). Имена полей настраиваются.
+    queue_json_id_field: str = "uuid"
+    queue_json_status_field: str = "status"
+    # Требовать ли csrf_token из строки для взятия. False — для SPA, где токена
+    # в HTML нет (он может быть в cookie/заголовке).
+    take_requires_csrf: bool = True
+    # Маркеры, по которым тело ответа считается страницей очереди (а не дашбордом).
+    # Нужны, чтобы отличить «заявки уже нет» от «редирект куда-то ещё».
+    queue_page_markers: tuple = ("payout-table", "payout-status", "payout-card")
+    # Подтверждать взятие только статусом «в работе/завершена». Нужно площадкам,
+    # где страница demands показывает ВСЕ заявки (включая доступные): там одно
+    # присутствие id ничего не доказывает. По умолчанию false — старое поведение.
+    confirm_requires_in_work: bool = False
+    # Маркеры формы входа в теле страницы (для _classify: «сессия слетела»).
+    login_form_markers: tuple = ("auth-form",)
+    # --- Селекторы нового 3-шагового SPA-входа (Email -> Password -> 2FA) ---
+    # Режим входа определяется автоматически по наличию поля #email; эти значения
+    # нужны, только если у площадки другие id/тексты кнопок. Дефолты = текущая форма.
+    spa_email_selector: str = "input#email"
+    spa_password_selector: str = "input#password"
+    spa_next_selector: str = "button:has-text('Далее')"
+    spa_submit_selector: str = "button:has-text('Войти')"
+    spa_twofa_input_selector: str = "input#twofa-code"
+
     @property
     def allowed_chat_id(self) -> int:
         """Первый (основной) админ — для обратной совместимости и логов."""
@@ -309,5 +369,53 @@ def load_config() -> Config:
         # Маркеры в теле ответа на POST take_payout (каждое значение — через запятую).
         take_success_markers=_split_markers(env.get("TAKE_SUCCESS_MARKERS", "")),
         take_gone_markers=_split_markers(env.get("TAKE_GONE_MARKERS", "")),
+        # --- Профиль площадки (разметка/эндпоинты). Пусто/не задано — дефолты Config.
+        site_host=(env.get("SITE_HOST") or "spark-trading.cash"),
+        signin_path=(env.get("SIGNIN_PATH") or "/signin"),
+        payout_row_markers=_split_markers(env.get("PAYOUT_ROW_MARKERS", ""))
+        or ("payout-status", "payout-table"),
+        payout_take_button_markers=_split_markers(env.get("PAYOUT_TAKE_BUTTON_MARKERS", ""))
+        or ("take_payout",),
+        status_available_markers=_split_markers(env.get("STATUS_AVAILABLE_MARKERS", ""))
+        or ("ждет провайдера", "не назначено"),
+        status_in_work_markers=_split_markers(env.get("STATUS_IN_WORK_MARKERS", ""))
+        or ("в работе у провайдера", "в работе"),
+        status_done_markers=_split_markers(env.get("STATUS_DONE_MARKERS", ""))
+        or ("выполнена", "выполнено", "завершена"),
+        empty_row_text=(env.get("EMPTY_ROW_TEXT") or "не найдено"),
+        row_id_text_pattern=(env.get("ROW_ID_TEXT_PATTERN") or r"#\s*(\d+)"),
+        take_api_url_template=(env.get("TAKE_API_URL_TEMPLATE") or ""),
+        take_payload_format=(env.get("TAKE_PAYLOAD_FORMAT") or "form").lower(),
+        take_id_field=(env.get("TAKE_ID_FIELD") or "payout_id"),
+        # Пустое значение в env = «поле не отправлять» (нужно для SPA/API, где
+        # в теле запроса есть только id заявки).
+        take_csrf_field=env.get("TAKE_CSRF_FIELD", "csrf_token"),
+        take_access_key_field=env.get("TAKE_ACCESS_KEY_FIELD", "access_key"),
+        take_act_field=env.get("TAKE_ACT_FIELD", "act"),
+        take_act_value=env.get("TAKE_ACT_VALUE", "take_payout"),
+        # SPA: csrf в заголовке из cookie (Laravel XSRF-TOKEN → X-XSRF-TOKEN).
+        take_csrf_header=(env.get("TAKE_CSRF_HEADER") or ""),
+        take_csrf_cookie=(env.get("TAKE_CSRF_COOKIE") or ""),
+        # SPA/Inertia: где в JSON лежит id и код статуса заявки.
+        queue_json_id_field=(env.get("QUEUE_JSON_ID_FIELD") or "uuid"),
+        queue_json_status_field=(env.get("QUEUE_JSON_STATUS_FIELD") or "status"),
+        take_requires_csrf=env.get("TAKE_REQUIRES_CSRF", "true").lower() == "true",
+        row_id_from_first_cell=env.get("ROW_ID_FROM_FIRST_CELL", "false").lower() == "true",
+        queue_page_markers=_split_markers(env.get("QUEUE_PAGE_MARKERS", ""))
+        or ("payout-table", "payout-status", "payout-card"),
+        login_form_markers=_split_markers(env.get("LOGIN_FORM_MARKERS", ""))
+        or ("auth-form",),
+        # Селекторы SPA-входа (Email -> Password -> 2FA); дефолты = текущая форма.
+        spa_email_selector=(env.get("SPA_EMAIL_SELECTOR") or "input#email"),
+        spa_password_selector=(env.get("SPA_PASSWORD_SELECTOR") or "input#password"),
+        spa_next_selector=(env.get("SPA_NEXT_SELECTOR") or "button:has-text('Далее')"),
+        spa_submit_selector=(env.get("SPA_SUBMIT_SELECTOR") or "button:has-text('Войти')"),
+        spa_twofa_input_selector=(
+            env.get("SPA_TWOFA_INPUT_SELECTOR") or "input#twofa-code"
+        ),
+        # Площадки, где demands показывает все статусы: подтверждать взятие
+        # только статусом «в работе/завершена» (см. CONFIRM_REQUIRES_IN_WORK).
+        confirm_requires_in_work=env.get("CONFIRM_REQUIRES_IN_WORK", "false").lower()
+        == "true",
     )
 
