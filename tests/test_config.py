@@ -229,6 +229,63 @@ class TakeMarkersConfigTest(unittest.TestCase):
             self.assertEqual(cfg.take_gone_markers, ("заявка не найдена", "уже взята"))
 
 
+class TakeFiltersConfigTest(unittest.TestCase):
+    """MINSUM/MAXSUM, TAKE_SKIP_MARKERS, QUEUE_JSON_AMOUNT_FIELD — фильтры взятия."""
+
+    BASE_ENV = DemandsSyncConfigTest.BASE_ENV
+
+    def test_defaults(self):
+        with patch.dict(os.environ, self.BASE_ENV, clear=True):
+            cfg = load_config()
+            self.assertIsNone(cfg.min_sum)
+            self.assertIsNone(cfg.max_sum)
+            self.assertEqual(cfg.queue_json_amount_field, "amount")
+            # Технические заявки «API» пропускаются по умолчанию.
+            self.assertEqual(cfg.take_skip_markers, ("api",))
+
+    def test_sums_are_parsed_with_separators(self):
+        env = dict(self.BASE_ENV, MINSUM="1 000", MAXSUM="50,000.50")
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+            self.assertEqual(cfg.min_sum, 1000.0)
+            self.assertEqual(cfg.max_sum, 50000.5)
+
+    def test_only_one_bound_can_be_set(self):
+        env = dict(self.BASE_ENV, MAXSUM="5000")
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+            self.assertIsNone(cfg.min_sum)
+            self.assertEqual(cfg.max_sum, 5000.0)
+
+    def test_invalid_sum_raises(self):
+        env = dict(self.BASE_ENV, MINSUM="abc")
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(RuntimeError):
+                load_config()
+
+    def test_min_greater_than_max_raises(self):
+        env = dict(self.BASE_ENV, MINSUM="500", MAXSUM="100")
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(RuntimeError):
+                load_config()
+
+    def test_amount_field_override(self):
+        env = dict(self.BASE_ENV, QUEUE_JSON_AMOUNT_FIELD="total")
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(load_config().queue_json_amount_field, "total")
+
+    def test_skip_markers_from_env(self):
+        env = dict(self.BASE_ENV, TAKE_SKIP_MARKERS="API, TEST")
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(load_config().take_skip_markers, ("api", "test"))
+
+    def test_empty_skip_markers_disable_filter(self):
+        # Пустое значение = фильтр выключен (а не «взять дефолт API»).
+        env = dict(self.BASE_ENV, TAKE_SKIP_MARKERS="")
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(load_config().take_skip_markers, ())
+
+
 class ProxyConfigTest(unittest.TestCase):
     """PROXY_URLS / PROXY_FILE / PROXY_ROTATE_ON_BLOCK."""
 

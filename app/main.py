@@ -150,6 +150,21 @@ def _run_self_check() -> int:
         cfg.headless,
     )
     logger.info("Точка входа: %s", getattr(run_worker, "__module__", run_worker))
+    # Фильтры взятия — часть конфига, поэтому показываем их в --check: чаще всего
+    # «бот не берёт заявки» объясняется именно ими (сумма вне диапазона, блок API).
+    low = getattr(cfg, "min_sum", None)
+    high = getattr(cfg, "max_sum", None)
+
+    def _fmt_bound(value: float | None) -> str:
+        return "-" if value is None else f"{value:g}"
+
+    logger.info(
+        "Фильтры взятия: сумма %s, пропуск заявок с маркерами %s",
+        f"[{_fmt_bound(low)}; {_fmt_bound(high)}]"
+        if (low is not None or high is not None)
+        else "не ограничена",
+        ", ".join(getattr(cfg, "take_skip_markers", ()) or ()) or "выключен",
+    )
     return 0
 
 

@@ -36,6 +36,13 @@ from urllib.parse import unquote, urlsplit
 import httpx
 
 from .config import Config
+from .filters import (
+    SKIP_REASON_TEXT,
+    amount_from_text,
+    parse_amount,
+    predictive_allowed,
+    row_skip_reason,
+)
 from .state import WorkerState
 
 logger = logging.getLogger("http_worker")
@@ -266,6 +273,53 @@ def _inertia_payload(html: str):
     return data if isinstance(data, dict) else None
 
 
+def _item_text(item: dict) -> str:
+    """Весь текст заявки из JSON одной строкой.
+
+    У Inertia нет готового текста строки (таблица рисуется из JSON), поэтому
+    склеиваем все строковые значения — по ним ищется маркер технической заявки
+    («API»), который разработчики кладут в комментарий/тип/название метода.
+    """
+    parts: list[str] = []
+
+    def walk(value, depth: int = 0) -> None:
+        if depth > 3:
+            return
+        if isinstance(value, dict):
+            for nested in value.values():
+                walk(nested, depth + 1)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                walk(nested, depth + 1)
+        elif isinstance(value, str):
+            parts.append(html_lib.unescape(value))
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            parts.append(str(value))
+
+    walk(item)
+    return " ".join(parts)
+
+
+# Типовые имена поля суммы у разных площадок: используем, если поля из
+# QUEUE_JSON_AMOUNT_FIELD в заявке нет.
+_AMOUNT_FIELD_CANDIDATES = ("amount", "sum", "total", "payout_amount", "amount_rub", "value")
+
+
+def _item_amount(item: dict, cfg: Config | None) -> float | None:
+    """Сумма заявки из JSON: поле из конфига, иначе — типовые имена."""
+    field = _cfg_str(cfg, "queue_json_amount_field", "amount") or "amount"
+    amount = parse_amount(item.get(field))
+    if amount is not None:
+        return amount
+    for name in _AMOUNT_FIELD_CANDIDATES:
+        if name == field:
+            continue
+        amount = parse_amount(item.get(name))
+        if amount is not None:
+            return amount
+    return None
+
+
 def _inertia_rows(html: str, cfg: Config | None = None) -> list[dict] | None:
     """Заявки из JSON Inertia (props.payouts.data) или None, если это не Inertia.
 
@@ -296,6 +350,10 @@ def _inertia_rows(html: str, cfg: Config | None = None) -> list[dict] | None:
                 "status": _status_from_code(str(item.get(status_field) or "")),
                 "csrf_token": None,
                 "access_key": "",
+                # Фильтры взятия: сумма (MINSUM/MAXSUM) и текст заявки, по
+                # которому ищется маркер технической заявки («API»).
+                "amount": _item_amount(item, cfg),
+                "text": _item_text(item),
             }
         )
     return rows
@@ -367,6 +425,9 @@ def parse_rows(html: str, cfg: Config | None = None) -> list[dict]:
                 "status": _extract_status(block, text, cfg),
                 "csrf_token": csrf.group(1) if csrf else None,
                 "access_key": access_key.group(1) if access_key else "",
+                # Фильтры взятия: сумма и текст строки (поиск блока «API»).
+                "amount": amount_from_text(text),
+                "text": text,
             }
         )
     return rows
@@ -843,7 +904,7 @@ def _poll_wait(cfg: Config) -> float:
     редким (джиттер до +50%), чтобы снизить GET-нагрузку/риск Cloudflare.
     """
     base = getattr(cfg, "predictive_take_poll_ms", 0) or 0
-    if cfg.predictive_take and base > 0:
+    if predictive_allowed(cfg) and base > 0:
         return _sleep_ms(base, int(base * 1.5))
     return _sleep_ms(cfg.take_poll_min_ms, cfg.take_poll_max_ms)
 
@@ -861,7 +922,7 @@ def _effective_pollers(cfg: Config) -> int:
     """
     pollers = max(1, cfg.take_parallel_pollers)
     base = getattr(cfg, "predictive_take_poll_ms", 0) or 0
-    if cfg.predictive_take and pollers > 1 and base > cfg.take_poll_max_ms:
+    if predictive_allowed(cfg) and pollers > 1 and base > cfg.take_poll_max_ms:
         return 1
     return pollers
 
@@ -1474,7 +1535,7 @@ async def predict_loop(
     notified_anchor: int | None = None
     while ws.running and ws.mode == "take":
         if (
-            not cfg.predictive_take
+            not predictive_allowed(cfg)
             or ws.last_order_id <= 0
             or (cfg.take_requires_csrf and not ws.last_csrf_token)
         ):
@@ -1537,6 +1598,28 @@ async def predict_loop(
 
         if gap:
             await asyncio.sleep(gap)
+
+
+# id, которые уже пропущены фильтрами (API/сумма). Нужен, чтобы писать причину
+# пропуска в лог ОДИН раз за сессию: очередь обновляется десятки раз в секунду,
+# и без этого лог превратился бы в спам (та же проблема была в Telegram).
+_SKIP_LOGGED: set[str] = set()
+
+
+def _skip_reason_for(row: dict, cfg: Config | None) -> str:
+    """Причина пропуска заявки ('' — можно брать) с логом один раз на id."""
+    reason = row_skip_reason(row, cfg)
+    if not reason:
+        return ""
+    key = f"{reason}:{row.get('id')}"
+    if key not in _SKIP_LOGGED:
+        _SKIP_LOGGED.add(key)
+        logger.info(
+            "Пропускаю заявку #%s: %s",
+            row.get("id"),
+            SKIP_REASON_TEXT.get(reason, reason),
+        )
+    return reason
 
 
 async def _poll_loop(
@@ -1624,6 +1707,11 @@ async def _poll_loop(
                 # а SPA-таблица показывает все статусы — без фильтра бот пытался
                 # бы «взять» заявки, которые уже в работе или завершены.
                 and _is_available_status(r.get("status"), cfg)
+                # Фильтры: не берём технические заявки разработчиков (в разметке
+                # блок «API») и заявки с суммой вне MINSUM..MAXSUM. Раньше такие
+                # строки уходили в POST, сервер их не отдавал — и в Telegram летел
+                # спам «заявку не взяли».
+                and not _skip_reason_for(r, cfg)
             ),
             None,
         )
@@ -1702,6 +1790,14 @@ async def take_loop(
         logger.info(
             "[%s] предиктив включён: воронок опроса %d → %d",
             account.name, configured_pollers, pollers,
+        )
+    if cfg.predictive_take and not predictive_allowed(cfg):
+        # Сумму предсказанного id проверить нечем — фильтр MINSUM/MAXSUM
+        # несовместим с предиктивом, иначе можно набрать заявок вне диапазона.
+        logger.warning(
+            "[%s] PREDICTIVE_TAKE отключён: задан фильтр суммы (MINSUM/MAXSUM). "
+            "Взятие идёт только по реальным строкам очереди.",
+            account.name,
         )
     await notify(
         f"⚡ HTTP-режим взятия запущен (без браузера). Цель: {cfg.target_queue_size} заявок, "

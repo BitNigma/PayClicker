@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlsplit
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 from .config import Config
+from .filters import SKIP_REASON_TEXT, amount_from_text, row_skip_reason
 from .state import state
 
 logger = logging.getLogger("worker")
@@ -1003,8 +1004,14 @@ def _register_dialog_autoaccept(page: Page):
 
 
 async def _parse_row(row) -> dict:
+    """Данные строки заявки: id, статус, сумма и текст (для фильтров взятия)."""
     order_id = None
     status = ""
+    text = ""
+    try:
+        text = (await row.inner_text()).strip()
+    except Exception:
+        pass
     try:
         id_el = await row.query_selector(SEL_ROW_ID)
         if id_el:
@@ -1018,11 +1025,41 @@ async def _parse_row(row) -> dict:
             status = (await badge_el.inner_text()).strip()
     except Exception:
         pass
-    return {"id": order_id, "status": status}
+    return {
+        "id": order_id,
+        "status": status,
+        # Сумма и текст нужны фильтрам MINSUM/MAXSUM и пропуску технических
+        # заявок разработчиков (в разметке блок «API», см. app/filters.py).
+        "amount": amount_from_text(text),
+        "text": text,
+    }
 
 
-async def _get_payout_rows(page: Page):
-    """Строки заявок (без строки-заглушки «Не найдено»), уже распарсенные."""
+# id, пропущенные фильтрами: пишем причину в лог один раз, чтобы не спамить
+# (страница перерисовывается несколько раз в секунду).
+_SKIP_LOGGED: set[str] = set()
+
+
+def _log_skipped(row: dict, reason: str) -> None:
+    key = f"{reason}:{row.get('id')}"
+    if key in _SKIP_LOGGED:
+        return
+    _SKIP_LOGGED.add(key)
+    logger.info(
+        "Пропускаю заявку #%s: %s",
+        row.get("id"),
+        SKIP_REASON_TEXT.get(reason, reason),
+    )
+
+
+async def _get_payout_rows(page: Page, cfg: Config | None = None, apply_filters: bool = False):
+    """Строки заявок (без строки-заглушки «Не найдено»), уже распарсенные.
+
+    apply_filters=True — дополнительно отбрасываем технические заявки «API» и
+    заявки с суммой вне MINSUM..MAXSUM (только для ОЧЕРЕДИ). Для страницы demands
+    фильтры не применяются: там считаются занятые слоты, и выкинутая строка
+    исказила бы их количество.
+    """
     raw_rows = await page.query_selector_all(SEL_PAYOUT_ROWS)
     result = []
     for row in raw_rows:
@@ -1033,6 +1070,11 @@ async def _get_payout_rows(page: Page):
         if not text or EMPTY_ROW_TEXT in text:
             continue
         parsed = await _parse_row(row)
+        if apply_filters:
+            reason = row_skip_reason(parsed, cfg)
+            if reason:
+                _log_skipped(parsed, reason)
+                continue
         parsed["el"] = row
         result.append(parsed)
     return result
@@ -1328,7 +1370,9 @@ async def fast_take_loop(choice_page: Page, confirm_page: Page, cfg: Config, not
             break
 
         try:
-            rows = await _get_payout_rows(choice_page)
+            # Фильтры взятия применяем ТОЛЬКО здесь, к очереди: технические
+            # заявки «API» и суммы вне MINSUM..MAXSUM не берём.
+            rows = await _get_payout_rows(choice_page, cfg, apply_filters=True)
         except Exception:
             continue
         if not rows:

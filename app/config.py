@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .filters import to_float
+
 
 @dataclass
 class Account:
@@ -113,6 +115,20 @@ class Config:
     # Формулировки площадки могут меняться — задаются через env (см. .env.example).
     take_success_markers: tuple = ()
     take_gone_markers: tuple = ()
+
+    # --- Фильтры взятия (см. app/filters.py) ---
+    # Брать только заявки с суммой в диапазоне [min_sum; max_sum]. None — граница
+    # не проверяется. Если фильтр включён, а сумму распознать не удалось, заявка
+    # НЕ берётся: лучше пропустить, чем взять не ту.
+    min_sum: float | None = None
+    max_sum: float | None = None
+    # Имя поля суммы в JSON Inertia (props.payouts.data[i].amount). Если такого
+    # поля нет, ищутся типовые имена (sum/total/payout_amount/value/…).
+    queue_json_amount_field: str = "amount"
+    # Маркеры технических заявок разработчиков: если в разметке/JSON строки есть
+    # блок с таким словом («API»), заявка не берётся — сервер её всё равно не
+    # отдаст, а попытки превращались в спам «не взяли» в Telegram.
+    take_skip_markers: tuple = ("api",)
 
     # --- Профиль площадки: разметка HTML и эндпоинт взятия ---
     # Значения по умолчанию = текущая площадка (spark-trading.cash): серверные
@@ -272,6 +288,27 @@ def _split_list(raw: str) -> list[str]:
 
 
 
+def _opt_float(env, *names: str) -> float | None:
+    """Необязательное число из env: первое непустое значение или None.
+
+    Понимает «1 000», «1 000,50», «1000.50» — тот же разбор, что и у сумм в
+    разметке (app.filters.to_float). Некорректное значение — ошибка конфига:
+    тихо игнорировать опечатку в MINSUM/MAXSUM опаснее, чем не запуститься.
+    """
+    for name in names:
+        raw = env.get(name)
+        if raw is None or not str(raw).strip():
+            continue
+        value = to_float(raw)
+        if value is None:
+            raise RuntimeError(
+                f"Некорректное число в {name}: {raw!r} (ожидается, например, 1000 или 1000.50)"
+            )
+        return value
+    return None
+
+
+
 def load_accounts(env) -> list[Account]:
     """Собирает список кабинетов из переменных окружения.
 
@@ -322,6 +359,14 @@ def load_config() -> Config:
     log_path = env.get("LOG_PATH", "/data/actions.log")
     metrics_default = str(Path(log_path).parent / "metrics.jsonl")
 
+    # Фильтры взятия: сумма заявки (MINSUM/MAXSUM) и маркеры технических заявок.
+    min_sum = _opt_float(env, "MINSUM", "MIN_SUM")
+    max_sum = _opt_float(env, "MAXSUM", "MAX_SUM")
+    if min_sum is not None and max_sum is not None and min_sum > max_sum:
+        raise RuntimeError(
+            f"MINSUM ({min_sum:g}) больше MAXSUM ({max_sum:g}) — диапазон сумм пустой"
+        )
+
     return Config(
         telegram_token=_req(env, "TELEGRAM_BOT_TOKEN"),
         allowed_chat_ids=parse_chat_ids(env),
@@ -369,6 +414,16 @@ def load_config() -> Config:
         # Маркеры в теле ответа на POST take_payout (каждое значение — через запятую).
         take_success_markers=_split_markers(env.get("TAKE_SUCCESS_MARKERS", "")),
         take_gone_markers=_split_markers(env.get("TAKE_GONE_MARKERS", "")),
+        # Фильтры взятия: сумма заявки и маркеры технических (API) заявок.
+        min_sum=min_sum,
+        max_sum=max_sum,
+        queue_json_amount_field=(env.get("QUEUE_JSON_AMOUNT_FIELD") or "amount"),
+        # Пустое значение TAKE_SKIP_MARKERS= отключает фильтр технических заявок.
+        take_skip_markers=(
+            _split_markers(env["TAKE_SKIP_MARKERS"])
+            if "TAKE_SKIP_MARKERS" in env
+            else ("api",)
+        ),
         # --- Профиль площадки (разметка/эндпоинты). Пусто/не задано — дефолты Config.
         site_host=(env.get("SITE_HOST") or "spark-trading.cash"),
         signin_path=(env.get("SIGNIN_PATH") or "/signin"),

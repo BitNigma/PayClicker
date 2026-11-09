@@ -67,6 +67,14 @@
    `CONFIRM_REQUIRES_IN_WORK=true` подтверждение — ТОЛЬКО статус «в работе»
    (`_is_in_work_status`): `expired`/`canceled` в demands НЕ считаются взятием.
    Тесты — `tests/test_inertia_spa.py`.
+3b. Фильтры взятия (`app/filters.py`): `MINSUM`/`MAXSUM` — брать только заявки с
+   суммой в диапазоне (включительно); если фильтр задан, а сумма не распознана,
+   заявка НЕ берётся. `TAKE_SKIP_MARKERS` (дефолт `API`) — строки с блоком «API»
+   в разметке/JSON пропускаются ДО POST: это технические заявки разработчиков,
+   взять их нельзя, а попытки давали спам «заявку не взяли» в Telegram.
+   `QUEUE_JSON_AMOUNT_FIELD` — имя поля суммы в `props.payouts.data` (дефолт
+   `amount`). Фильтры применяются только к очереди (не к demands), предиктив при
+   фильтре суммы отключается. Тесты — `tests/test_filters.py`.
 4. Прогнать тесты `SpaPlatformTest` в `tests/test_http_worker.py` (и
    `tests/test_inertia_spa.py` для Inertia) и снять дамп первой же страницы
    очереди (`DEBUG_CAPTURE_ATTEMPTS=true`), чтобы сверить маркеры с реальной
@@ -147,6 +155,8 @@ HTTP-цикл будут конкурировать за одни и те же �
 | Взяли заявку или нет — что ответил сервер | `_classify_take_response()` по телу `POST take_payout` (`TAKE_REPLY_*`); дамп `./data/take_request_http_*.json` (`text_head` до `TAKE_DUMP_BODY_CHARS` + `server_reply`); ground truth всё равно `_confirm_taken` по demands, **кроме предсказанных id с ответом `gone`** (тогда `confirmed=False` без GET — иначе 63k предсказанных POST дают ~126k лишних GET). `unknown` = ответ не похож на страницу очереди (редирект на дашборд) |
 | «Не вижу предиктивных POST» | они есть, но по умолчанию не дампятся и молчат. Ищите в `./data/metrics.jsonl` записи с `"predicted": true` (и `poll_rtt_ms=null`), строку лога `🔮 превентивно: окно …`; дампы — `PREDICTIVE_TAKE_DUMPS=true` |
 | «🔮 Превентивно…» дублируется в Telegram | так было раньше: сообщение слалось раз в `PREDICTIVE_NOTIFY_MIN_S` (3с) с неизменным якорем (`observed_anchor`). Теперь — один раз на НОВЫЙ якорь и с реальным окном `#a…#b`. Тишина: `DEBUG=false` |
+| Спам «ℹ️ Заявку #… не взяли» и попытки взять технические заявки | это заявки с блоком «API» в разметке (тестирование разработчиков): взять их нельзя, сервер отвечает ошибкой. `TAKE_SKIP_MARKERS=API` (по умолчанию) отбрасывает такие строки ДО POST (`app/filters.py`: `row_skip_reason`), причина пишется в лог один раз на id. Выключить — `TAKE_SKIP_MARKERS=` |
+| Бот не берёт заявки, хотя они есть | проверьте `MINSUM`/`MAXSUM` (`python -m app.main --check` печатает диапазон). Если фильтр включён, а сумма не распознана (`QUEUE_JSON_AMOUNT_FIELD`), заявка пропускается — в логе «Пропускаю заявку #… сумма не распознана» |
 | Счётчик очереди расходится | сверка `DEMANDS_URL`, `resync_demand*s`, `/reset_session` |
 | Заявки «берутся», но на самом деле чужие/нераспределённые | площадка показывает в demands ВСЕ заявки (SPA): подтверждение шло по факту строки с id. Включите `CONFIRM_REQUIRES_IN_WORK=true` — `_confirm_taken` примет заявку только со статусом «в работе/завершена» (`status_in_work_markers`/`status_done_markers`). Тест `SpaPlatformTest.test_confirm_requires_in_work_rejects_available_row` |
 | SPA: строки таблицы не находятся, id пустой | id лежит текстом в первой ячейке `<td>`, а не в скрытом поле/«# 123». Нужны `ROW_ID_FROM_FIRST_CELL=true` + `PAYOUT_ROW_MARKERS`/`STATUS_*_MARKERS` под разметку (`parse_rows`, `_first_td_text`). Тест `test_parses_row_with_id_in_first_cell` |
