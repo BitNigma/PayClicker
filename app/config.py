@@ -130,6 +130,22 @@ class Config:
     # отдаст, а попытки превращались в спам «не взяли» в Telegram.
     take_skip_markers: tuple = ("api",)
 
+    # --- Темп запросов к сайту и реакция на антибот (см. PayoutClient._throttle) ---
+    # Минимальный интервал между запросами ОДНОГО кабинета, мс. 0 — без паузы.
+    # Для DataDome/Cloudflare держите 100-200: 2 воронки по 60 мс дают ~20 req/s,
+    # и сайт начинает отвечать 429 «HTTP-клиент распознан» (в режиме watch нет
+    # POST/подтверждений и запросов в разы меньше, поэтому там всё работало).
+    http_min_interval_ms: int = 0
+    # Потолок адаптивной паузы: после 429 интервал удваивается до этого предела.
+    http_max_interval_ms: int = 5000
+    # Сколько ждать при 429, если сайт не прислал заголовок Retry-After, сек.
+    http_rate_limit_cooldown_s: float = 3.0
+    # Сколько раз ПОДРЯД терпеть 403/challenge с паузами, прежде чем сбрасывать
+    # cookies и переавторизовываться (сброс сессии — крайняя мера).
+    http_block_retries: int = 3
+    # Базовая пауза перед повтором после 403/challenge, сек (растёт экспоненциально).
+    http_block_backoff_s: float = 5.0
+
     # --- Профиль площадки: разметка HTML и эндпоинт взятия ---
     # Значения по умолчанию = текущая площадка (spark-trading.cash): серверные
     # формы с csrf_token. Другая площадка задаётся через env (см.
@@ -424,6 +440,14 @@ def load_config() -> Config:
             if "TAKE_SKIP_MARKERS" in env
             else ("api",)
         ),
+        # Темп запросов и реакция на антибот (429/403). См. Config.http_min_interval_ms.
+        http_min_interval_ms=max(0, int(env.get("HTTP_MIN_INTERVAL_MS", "0"))),
+        http_max_interval_ms=max(0, int(env.get("HTTP_MAX_INTERVAL_MS", "5000"))),
+        http_rate_limit_cooldown_s=max(
+            0.0, float(env.get("HTTP_RATE_LIMIT_COOLDOWN_S", "3"))
+        ),
+        http_block_retries=max(0, int(env.get("HTTP_BLOCK_RETRIES", "3"))),
+        http_block_backoff_s=max(0.0, float(env.get("HTTP_BLOCK_BACKOFF_S", "5"))),
         # --- Профиль площадки (разметка/эндпоинты). Пусто/не задано — дефолты Config.
         site_host=(env.get("SITE_HOST") or "spark-trading.cash"),
         signin_path=(env.get("SIGNIN_PATH") or "/signin"),

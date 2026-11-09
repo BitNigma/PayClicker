@@ -223,6 +223,22 @@ proxy=...)`), и в браузерной авторизации (`_build_context
 `SPA_NEXT_SELECTOR`, `SPA_SUBMIT_SELECTOR`, `SPA_TWOFA_INPUT_SELECTOR`.
 Порядок переезда и пример SPA-профиля — `LOCAL_RUN.md` (разделы 6 и 6a).
 
+### Темп запросов и антибот (429/403)
+
+`PayoutClient` держит **один общий лимит частоты на кабинет** (`HTTP_MIN_INTERVAL_MS`):
+все воронки опроса, подтверждения и POST делят его, поэтому суммарная частота не
+растёт вместе с `TAKE_PARALLEL_POLLERS`. При 429/503 — `RateLimited`: интервал
+удваивается (до `HTTP_MAX_INTERVAL_MS`), пауза берётся из `Retry-After` (или
+`HTTP_RATE_LIMIT_COOLDOWN_S`), **cookies не сбрасываются**. При 403/challenge —
+`BlockedError`, но цикл сначала «терпит» `HTTP_BLOCK_RETRIES` пауз
+(`HTTP_BLOCK_BACKOFF_S`, экспоненциально), и только потом просит реавторизацию.
+
+Раньше любой 429 считался «HTTP-клиент распознан» и удалял `auth.json`, после чего
+бот уходил в headless-вход (Cloudflare его не пускает) — получался вечный цикл
+«антибот → сброс cookies → антибот». Отсюда и разница режимов: `watch` опрашивает
+1-2 раза/с, а `run` с 2 воронками по 60 мс давал ~20 req/s + POST и подтверждения.
+Тесты — `tests/test_rate_limit.py`.
+
 ### Фильтры взятия (сумма и технические заявки «API»)
 
 Логика — в `app/filters.py`, значения — в env:

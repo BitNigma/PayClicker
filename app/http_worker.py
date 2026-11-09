@@ -29,6 +29,8 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -63,6 +65,58 @@ class SessionExpired(Exception):
 
 class BlockedError(Exception):
     """Антибот (DataDome/Cloudflare) отдал challenge/403 вместо обычного HTML."""
+
+
+class RateLimited(Exception):
+    """Сайт ограничил ЧАСТОТУ запросов (HTTP 429/503) — сессия при этом жива.
+
+    Отдельный тип нужен, чтобы горячий цикл не сбрасывал cookies и не уходил в
+    браузерную реавторизацию на каждый 429. Прежнее поведение превращало
+    «слишком частые запросы» в «постоянно получаем антибот»: любой 429 удалял
+    auth.json, headless-вход не проходил Cloudflare, и всё повторялось по кругу.
+    Правильная реакция — пауза и снижение темпа (см. PayoutClient._penalize).
+    """
+
+    def __init__(self, retry_after: float | None = None, status: int = 429):
+        self.retry_after = retry_after
+        self.status = status
+        super().__init__(
+            f"HTTP {status}: сайт ограничил частоту запросов. Это не проблема cookies — "
+            "бот делает паузу и продолжает с меньшим темпом."
+        )
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Заголовок Retry-After → секунды (число или HTTP-дата). None, если нет."""
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except ValueError:
+        pass
+    try:
+        moment = parsedate_to_datetime(str(raw))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return max(0.0, (moment - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
+# Не спамим одинаковыми предупреждениями о лимитах: не чаще одного сообщения
+# на кабинет за RATE_NOTICE_GAP_S секунд (иначе при шторме 429 это был бы ад).
+RATE_NOTICE_GAP_S = 30.0
+_RATE_NOTICE_AT: dict[str, float] = {}
+
+
+async def _notify_rate_limit(notify, name: str, text: str) -> None:
+    """Сообщение о лимите/блокировке с защитой от повторов."""
+    now = time.monotonic()
+    if now - _RATE_NOTICE_AT.get(name, 0.0) < RATE_NOTICE_GAP_S:
+        return
+    _RATE_NOTICE_AT[name] = now
+    await notify(text)
 
 
 # Сколько раз подряд разрешено сбросить cookies и авторизоваться заново после
@@ -765,30 +819,98 @@ class PayoutClient:
         if proxy:
             kwargs["proxy"] = proxy
         self._client = httpx.AsyncClient(**kwargs)
+        # --- Темп запросов (антибот) ---
+        # Один клиент на кабинет, поэтому лимит общий для ВСЕХ воронок опроса,
+        # подтверждений и POST: они не могут «сложиться» в 20+ req/s.
+        # interval растёт при 429 и плавно возвращается к base после успехов.
+        self._base_interval = max(
+            0, int(getattr(cfg, "http_min_interval_ms", 0) or 0)
+        ) / 1000
+        self._max_interval = max(
+            self._base_interval,
+            int(getattr(cfg, "http_max_interval_ms", 5000) or 5000) / 1000,
+        )
+        self._interval = self._base_interval
+        self._next_at = 0.0
+        self._throttle_lock = asyncio.Lock()
+        self._ok_streak = 0
+        self._penalties = 0
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    async def _throttle(self) -> None:
+        """Держит общий темп запросов клиента (общий для всех воронок опроса).
+
+        Без этого каждая воронка спала свои TAKE_POLL_MIN/MAX_MS независимо, и
+        суммарная частота получалась кратной их числу — именно на этом сайте
+        срабатывал антибот (в watch-режиме запросов в разы меньше, поэтому там
+        всё работало).
+        """
+        if self._interval <= 0 and self._next_at <= 0:
+            return
+        async with self._throttle_lock:
+            now = time.monotonic()
+            wait = self._next_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = time.monotonic()
+            self._next_at = now + self._interval
+
+    def _penalize(self, retry_after: float | None) -> float:
+        """429/503 или challenge: замедляемся. Возвращает паузу до повтора, сек."""
+        cooldown = retry_after
+        if cooldown is None:
+            cooldown = float(getattr(self.cfg, "http_rate_limit_cooldown_s", 3.0) or 3.0)
+        # Не ждём бесконечно, если сайт прислал огромный Retry-After.
+        cooldown = max(0.0, min(float(cooldown), 120.0))
+        start = self._base_interval or 1.0
+        self._interval = min(self._max_interval, max(start, self._interval * 2))
+        self._next_at = max(self._next_at, time.monotonic() + cooldown)
+        self._ok_streak = 0
+        self._penalties += 1
+        return cooldown
+
+    def _reward(self) -> None:
+        """Успешный ответ: после серии успехов плавно возвращаемся к базовому темпу."""
+        self._ok_streak += 1
+        if self._ok_streak < 10:
+            return
+        self._ok_streak = 0
+        if self._interval > self._base_interval:
+            self._interval = max(self._base_interval, self._interval * 0.75)
+
+    def _check_status(self, response: httpx.Response) -> None:
+        """429/503 → RateLimited (это лимит частоты, а НЕ протухшие cookies)."""
+        if response.status_code in (429, 503):
+            delay = self._penalize(_retry_after_seconds(response))
+            raise RateLimited(retry_after=delay, status=response.status_code)
+
     def _check(self, response: httpx.Response) -> None:
+        self._check_status(response)
         kind = _classify(response.text, str(response.url), self.cfg)
-        # 403/429 — сайт (Cloudflare/антибот) заблокировал HTTP-клиент: даже если
-        # тело не похоже на challenge, продолжать опрос бессмысленно.
-        if kind == "blocked" or response.status_code in (403, 429):
+        # 403/challenge — сайт распознал HTTP-клиент как бота. Но сбрасывать
+        # cookies сразу нельзя: часто это временный challenge (пауза помогает),
+        # поэтому горячий цикл сначала «терпит» несколько блокировок.
+        if kind == "blocked" or response.status_code == 403:
+            self._penalize(None)
             raise BlockedError(
                 f"Сайт отдал антибот-заглушку/HTTP {response.status_code} вместо "
-                "страницы: HTTP-клиент распознан (DataDome/Cloudflare). Нужно "
-                "обновить cookies через браузерную авторизацию (или вернуться на "
-                "WORKER_BACKEND=browser)."
+                "страницы: HTTP-клиент распознан (DataDome/Cloudflare). Бот выждет "
+                "паузу и повторит; cookies сбрасываются только если не поможет."
             )
         if kind == "signin":
             raise SessionExpired("Сессия недействительна — сайт редиректит на /signin.")
+        self._reward()
 
     async def fetch_queue(self) -> str:
+        await self._throttle()
         response = await self._client.get(self.cfg.queue_url)
         self._check(response)
         return response.text
 
     async def fetch_demands(self) -> str:
+        await self._throttle()
         response = await self._client.get(self.cfg.demands_url)
         self._check(response)
         return response.text
@@ -867,15 +989,21 @@ class PayoutClient:
         fmt = _cfg_str(self.cfg, "take_payload_format", "form").lower()
         url = self.take_url(order_id)
         headers = self._take_headers(order_id, csrf_token)
+        await self._throttle()
         if fmt == "none":
-            return await self._client.post(url, headers=headers)
-        data = self._take_payload(order_id, csrf_token, access_key)
-        if fmt == "json":
-            headers["content-type"] = "application/json"
-            headers["accept"] = "application/json"
-            return await self._client.post(url, json=data, headers=headers)
-        headers["content-type"] = "application/x-www-form-urlencoded"
-        return await self._client.post(url, data=data, headers=headers)
+            response = await self._client.post(url, headers=headers)
+        else:
+            data = self._take_payload(order_id, csrf_token, access_key)
+            if fmt == "json":
+                headers["content-type"] = "application/json"
+                headers["accept"] = "application/json"
+                response = await self._client.post(url, json=data, headers=headers)
+            else:
+                headers["content-type"] = "application/x-www-form-urlencoded"
+                response = await self._client.post(url, data=data, headers=headers)
+        # 429/503 на POST — это тоже лимит частоты, а не «сервер не понял форму».
+        self._check_status(response)
+        return response
 
 
 def _queue_snapshot_text(cfg: Config, ws: WorkerState) -> str:
@@ -933,6 +1061,30 @@ async def _session_ok(client: PayoutClient) -> bool:
         return True
     except SessionExpired:
         return False
+    except RateLimited as exc:
+        # 429 — НЕ протухшая сессия. Раньше на этом бот удалял auth.json и уходил
+        # в headless-авторизацию, которую Cloudflare не пропускает: получался
+        # вечный цикл «антибот → сброс cookies → антибот».
+        logger.warning(
+            "Проверка сессии: сайт ограничил частоту (HTTP %s) — пауза %.1f с",
+            exc.status,
+            exc.retry_after or 0.0,
+        )
+        await asyncio.sleep(min(exc.retry_after or 3.0, 30.0))
+        try:
+            await client.fetch_queue()
+            return True
+        except SessionExpired:
+            return False
+        except RateLimited as again:
+            logger.warning(
+                "Проверка сессии: снова лимит (HTTP %s) — считаю сессию живой",
+                again.status,
+            )
+            return True
+        except Exception:
+            logger.exception("Проверка сессии не удалась (сеть?)")
+            return False
     except BlockedError:
         raise
     except Exception:
@@ -958,17 +1110,42 @@ async def ensure_session(
         probe = PayoutClient(cfg, cookies, proxy=proxy)
         try:
             if await _session_ok(probe):
+                # Отмечаем вход: по этому флагу /status и /run пишут правду
+                # («сессия активна»), а не «запускаю авторизацию».
+                ws.logged_in = True
+                logger.info(
+                    "[%s] сохранённая сессия действительна — браузер не нужен "
+                    "(горячий цикл идёт по HTTP)",
+                    account.name,
+                )
                 return cookies
+            ws.logged_in = False
+            logger.info("[%s] сохранённая сессия недействительна — нужен вход", account.name)
         finally:
             await probe.aclose()
 
+    if cfg.headless:
+        # Частая причина «авторизация не запускается»: окно headless невидимо, а
+        # Cloudflare на SPA-площадке такой вход не пропускает (challenge).
+        logger.warning(
+            "[%s] HEADLESS=true: окно входа НЕ появится. Если Cloudflare не "
+            "пропускает headless-вход — запустите с HEADLESS=false: горячий цикл "
+            "всё равно идёт по HTTP, окно нужно только для входа.",
+            account.name,
+        )
+    logger.info(
+        "[%s] разовая браузерная авторизация (headless=%s)", account.name, cfg.headless
+    )
     await notify("🔐 Cookies недействительны/сброшены — разовая браузерная авторизация (вне горячего цикла)...")
     from .browser_worker import login_via_browser  # локальный импорт: браузер нужен только тут
 
     ok = await login_via_browser(cfg, account, ws, notify, notify_file, proxy=proxy)
     if not ok:
+        ws.logged_in = False
         return None
-    return load_cookies(account, cfg) or None
+    cookies = load_cookies(account, cfg) or None
+    ws.logged_in = bool(cookies)
+    return cookies
 
 
 def _safe_text(response: httpx.Response) -> str:
@@ -1084,6 +1261,9 @@ async def _confirm_taken(
                 return True
         except SessionExpired:
             raise
+        except RateLimited as exc:
+            # Подтверждение — не повод ругаться трейсбеком: просто ждём лимит.
+            await asyncio.sleep(min(exc.retry_after or 1.0, 10.0))
         except Exception:
             logger.exception("Ошибка при подтверждении взятия заявки #%s", order_id)
         await asyncio.sleep(delay)
@@ -1147,6 +1327,21 @@ async def _do_take(
             t_post = time.perf_counter()
             try:
                 response = await client.take_payout(order_id, csrf_token, access_key)
+            except RateLimited as exc:
+                # POST тоже может попасть под лимит частоты: выжидаем и выходим.
+                # Заявка вернётся в кандидаты на следующем GET (inflight снимется).
+                wait = exc.retry_after or 2.0
+                logger.warning(
+                    "[%s] POST #%s: сайт ограничил частоту (HTTP %s) — пауза %.1f с",
+                    account.name, order_id, exc.status, wait,
+                )
+                await _notify_rate_limit(
+                    notify, account.name,
+                    f"⏳ Взятие: сайт ограничил частоту (HTTP {exc.status}), "
+                    f"пауза {wait:.0f} с.",
+                )
+                await asyncio.sleep(min(wait, 30.0))
+                return False
             except Exception as exc:
                 logger.warning("[%s] POST take_payout для #%s не удался: %s", account.name, order_id, exc)
                 return False
@@ -1356,6 +1551,10 @@ async def watch_loop(
                 f"(цель задаётся TARGET_QUEUE_SIZE)."
             )
     prev_ids: set = set()
+    # 403/challenge: как и в горячем цикле, сначала «терпим» паузами, не сбрасывая
+    # cookies (см. _poll_loop). Watch раньше останавливался на первом же блоке —
+    # после реавторизации терялась сессия, и наблюдение больше не запускалось.
+    block_streak = 0
 
     while ws.running and ws.mode == "watch":
         if ws.resync_required:
@@ -1370,9 +1569,39 @@ async def watch_loop(
             ws.running = False
             await notify("⚠️ Сессия слетела. Останавливаю наблюдение. Запусти кабинет заново (/run).")
             break
+        except RateLimited as exc:
+            wait = exc.retry_after or 2.0
+            logger.warning(
+                "[%s] watch: сайт ограничил частоту (HTTP %s) — пауза %.1f с",
+                account.name, exc.status, wait,
+            )
+            await _notify_rate_limit(
+                notify, account.name,
+                f"⏳ Наблюдение: сайт ограничил частоту (HTTP {exc.status}), "
+                f"пауза {wait:.0f} с. Cookies в порядке, продолжаю.",
+            )
+            await asyncio.sleep(wait)
+            continue
         except BlockedError as exc:
-            # Блокировка (403/антибот, Cloudflare): останавливаем наблюдение и
-            # просим run_worker сбросить cookies и переавторизоваться (needs_reauth).
+            block_streak += 1
+            tries = max(0, int(getattr(cfg, "http_block_retries", 3) or 0))
+            if block_streak <= tries:
+                delay = min(
+                    float(getattr(cfg, "http_block_backoff_s", 5.0) or 5.0)
+                    * (2 ** (block_streak - 1)),
+                    60.0,
+                )
+                logger.warning(
+                    "[%s] watch: антибот-заглушка (%d/%d) — пауза %.0f с",
+                    account.name, block_streak, tries, delay,
+                )
+                await _notify_rate_limit(
+                    notify, account.name,
+                    f"⏳ Наблюдение: антибот-заглушка (попытка {block_streak}/{tries}), "
+                    f"пауза {delay:.0f} с. Cookies не сбрасываю.",
+                )
+                await asyncio.sleep(delay)
+                continue
             ws.needs_reauth = True
             ws.running = False
             await notify(f"⛔ {exc}")
@@ -1385,6 +1614,7 @@ async def watch_loop(
 
         rows = parse_rows(html, cfg)
         t_parsed = time.perf_counter()
+        block_streak = 0
         ids = {r["id"] for r in rows}
         new_ids = ids - prev_ids
 
@@ -1640,6 +1870,10 @@ async def _poll_loop(
     следующим опросом, а не удлиняет паузу между опросами.
     """
     prev_get = 0.0
+    # Сколько раз ПОДРЯД сайт отдал 403/challenge. Пока не превышен
+    # HTTP_BLOCK_RETRIES — выжидаем паузу и повторяем, НЕ сбрасывая cookies
+    # (сброс сессии — крайняя мера: headless-вход Cloudflare часто не пускает).
+    block_streak = 0
     while ws.running and ws.mode == "take":
         # Занятые слоты: заявки «в работе» на площадке + наши неподтверждённые
         # отправки. Спекулятивные (предсказанные) отправки НЕ считаем — иначе
@@ -1661,9 +1895,44 @@ async def _poll_loop(
             ws.running = False
             await notify("⚠️ Сессия слетела во время взятия заявок. Останавливаю. Запусти кабинет заново (/run).")
             return
+        except RateLimited as exc:
+            # Лимит частоты — это НЕ повод сбрасывать cookies и переавторизовываться.
+            # Просто выжидаем (Retry-After/кулдаун) и продолжаем с меньшим темпом.
+            wait = exc.retry_after or 2.0
+            logger.warning(
+                "[%s] сайт ограничил частоту (HTTP %s) — пауза %.1f с, cookies не трогаю",
+                account.name, exc.status, wait,
+            )
+            await _notify_rate_limit(
+                notify, account.name,
+                f"⏳ Сайт ограничил частоту запросов (HTTP {exc.status}). "
+                f"Пауза {wait:.0f} с, темп снижен. Cookies в порядке — "
+                "авторизация не нужна, взятие продолжается.",
+            )
+            await asyncio.sleep(wait)
+            continue
         except BlockedError as exc:
-            # Блокировка (403/антибот, Cloudflare): останавливаем взятие и просим
-            # run_worker сбросить cookies и переавторизоваться (needs_reauth).
+            block_streak += 1
+            tries = max(0, int(getattr(cfg, "http_block_retries", 3) or 0))
+            if block_streak <= tries:
+                delay = min(
+                    float(getattr(cfg, "http_block_backoff_s", 5.0) or 5.0)
+                    * (2 ** (block_streak - 1)),
+                    60.0,
+                )
+                logger.warning(
+                    "[%s] антибот-заглушка (%d/%d) — пауза %.0f с, cookies НЕ сбрасываю",
+                    account.name, block_streak, tries, delay,
+                )
+                await _notify_rate_limit(
+                    notify, account.name,
+                    f"⏳ Сайт отдал антибот-заглушку (попытка {block_streak}/{tries}). "
+                    f"Пауза {delay:.0f} с, cookies не сбрасываю — если не поможет, "
+                    "переавторизуюсь автоматически.",
+                )
+                await asyncio.sleep(delay)
+                continue
+            # Паузы не помогли — теперь действительно нужна реавторизация.
             ws.needs_reauth = True
             ws.running = False
             await notify(f"⛔ {exc}")
@@ -1675,6 +1944,9 @@ async def _poll_loop(
         t_recv = time.perf_counter()
         rows = parse_rows(html, cfg)
         t_parsed = time.perf_counter()
+
+        # Ответ получен — блокировок подряд больше нет.
+        block_streak = 0
 
         timing = {
             "poll_rtt_ms": round((t_recv - t_sent) * 1000, 2),
@@ -1984,10 +2256,22 @@ async def run_worker(cfg: Config, account, ws: WorkerState, notify, notify_file)
     async def acct_notify_file(path: str, caption: str = ""):
         await notify_file(path, f"[{account.name}] {caption}".strip())
 
+    waiting_logged = False
     while True:
         if not ws.running:
+            # Один раз объясняем в консоли, чего ждём: иначе запуск выглядит как
+            # «ничего не происходит» — браузер в http-режиме не открывается вообще
+            # (он нужен только для разового входа, когда сессия недействительна).
+            if not waiting_logged:
+                logger.info(
+                    "[%s] воркер готов и ждёт команду /run в Telegram "
+                    "(вход — /start_session; до команды запросов к сайту нет)",
+                    account.name,
+                )
+                waiting_logged = True
             await asyncio.sleep(1)
             continue
+        waiting_logged = False
 
         try:
             cookies = await ensure_session(

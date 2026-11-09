@@ -75,6 +75,12 @@
    `QUEUE_JSON_AMOUNT_FIELD` — имя поля суммы в `props.payouts.data` (дефолт
    `amount`). Фильтры применяются только к очереди (не к demands), предиктив при
    фильтре суммы отключается. Тесты — `tests/test_filters.py`.
+3c. Темп запросов и антибот: `HTTP_MIN_INTERVAL_MS` — ОБЩИЙ лимит частоты клиента
+   кабинета (воронки опроса, подтверждения и POST делят его), `HTTP_MAX_INTERVAL_MS`
+   — потолок адаптивной паузы, `HTTP_RATE_LIMIT_COOLDOWN_S` — пауза при 429 без
+   `Retry-After`, `HTTP_BLOCK_RETRIES`/`HTTP_BLOCK_BACKOFF_S` — сколько раз терпеть
+   403/challenge паузами до сброса cookies. 429 → `RateLimited` (пауза, cookies
+   НЕ трогаем), 403 → `BlockedError` с терпением. Тесты — `tests/test_rate_limit.py`.
 4. Прогнать тесты `SpaPlatformTest` в `tests/test_http_worker.py` (и
    `tests/test_inertia_spa.py` для Inertia) и снять дамп первой же страницы
    очереди (`DEBUG_CAPTURE_ATTEMPTS=true`), чтобы сверить маркеры с реальной
@@ -145,6 +151,7 @@ HTTP-цикл будут конкурировать за одни и те же �
 | «Форма входа не появилась» | `debug_login_form_missing_*.html`; селекторы `SEL_LOGIN_*`, таймаут `LOGIN_FORM_TIMEOUT_S` |
 | После входа окно браузера исчезает, кнопку взятия нажать негде | так и задумано у HTTP-цикла: `login_via_browser` сохраняет cookies в `auth.json` и закрывает Chromium. Для живого окна с автообновлением, кликом и перехватом запроса — `python -m app.take_capture` (см. «Узнать реальный запрос взятия»); дампы в `./data/take_capture/` |
 | `take_capture` не видит кнопку взятия | кнопка ищется по ТЕКСТУ (не по классу): добавьте её подпись в `--button-text "…,…"` или в `PAYOUT_TAKE_BUTTON_MARKERS`; при `--no-click` сохраняется `./data/take_capture/watch_*.html` для подбора разметки |
+| `python -m app.main` «ничего не делает»: браузер не открылся, заявки не берутся | это норма для `WORKER_BACKEND=http`: браузер участвует только в разовом входе, а работа стартует по `/run` в Telegram. В логе теперь явно: «воркер готов и ждёт команду /run», а `/status` показывает вход (`ws.logged_in`). Вход — `/start_session`; при `HEADLESS=true` окно входа невидимо и Cloudflare часто его не пропускает → `HEADLESS=false` (горячий цикл всё равно по HTTP). Видимое окно с кликом — `python -m app.take_capture` |
 | Заявки не берутся, хотя сессия жива | `./data/metrics.jsonl` (`saw_to_sent_ms`, `poll_rtt_ms`, `submit_rtt_ms`); `tools/metrics_report.py` |
 | Предиктив «слепнет» / убегает вперёд | `predict_loop` + `_poll_loop`: спекулятивные отправки в `ws.predicted_inflight` не считаются слотами; при полной очереди предсказатель ждёт; курсор догоняет `observed_anchor`; предел — `PREDICTIVE_TAKE_LOOKAHEAD` |
 | Много GET → бан Cloudflare | по умолчанию горячий цикл активен (`TAKE_POLL_MIN/MAX_MS` × `TAKE_PARALLEL_POLLERS`). Чтобы снизить нагрузку, задайте `PREDICTIVE_TAKE_POLL_MS` БОЛЬШЕ `TAKE_POLL_MAX_MS` (напр. 800–1500): опрос станет редким и воронка одна (`_poll_wait`/`_effective_pollers`). Значение МЕНЬШЕ (напр. 1) — наоборот, агрессивнее, воронки все |
@@ -156,6 +163,7 @@ HTTP-цикл будут конкурировать за одни и те же �
 | «Не вижу предиктивных POST» | они есть, но по умолчанию не дампятся и молчат. Ищите в `./data/metrics.jsonl` записи с `"predicted": true` (и `poll_rtt_ms=null`), строку лога `🔮 превентивно: окно …`; дампы — `PREDICTIVE_TAKE_DUMPS=true` |
 | «🔮 Превентивно…» дублируется в Telegram | так было раньше: сообщение слалось раз в `PREDICTIVE_NOTIFY_MIN_S` (3с) с неизменным якорем (`observed_anchor`). Теперь — один раз на НОВЫЙ якорь и с реальным окном `#a…#b`. Тишина: `DEBUG=false` |
 | Спам «ℹ️ Заявку #… не взяли» и попытки взять технические заявки | это заявки с блоком «API» в разметке (тестирование разработчиков): взять их нельзя, сервер отвечает ошибкой. `TAKE_SKIP_MARKERS=API` (по умолчанию) отбрасывает такие строки ДО POST (`app/filters.py`: `row_skip_reason`), причина пишется в лог один раз на id. Выключить — `TAKE_SKIP_MARKERS=` |
+| В `run` постоянный антибот/429, а в `watch` всё работает | разница в частоте: `run` опрашивал очередь 2 воронками по 60-140 мс (~20 req/s) + POST и подтверждения, `watch` — 1-2 req/s. Теперь темп ограничен `HTTP_MIN_INTERVAL_MS` (общий лимит на кабинет), 429 → `RateLimited`: пауза по `Retry-After` и снижение темпа, cookies НЕ сбрасываются; 403 терпится `HTTP_BLOCK_RETRIES` паузами до реавторизации. Проверьте `TAKE_PARALLEL_POLLERS=1` |
 | Бот не берёт заявки, хотя они есть | проверьте `MINSUM`/`MAXSUM` (`python -m app.main --check` печатает диапазон). Если фильтр включён, а сумма не распознана (`QUEUE_JSON_AMOUNT_FIELD`), заявка пропускается — в логе «Пропускаю заявку #… сумма не распознана» |
 | Счётчик очереди расходится | сверка `DEMANDS_URL`, `resync_demand*s`, `/reset_session` |
 | Заявки «берутся», но на самом деле чужие/нераспределённые | площадка показывает в demands ВСЕ заявки (SPA): подтверждение шло по факту строки с id. Включите `CONFIRM_REQUIRES_IN_WORK=true` — `_confirm_taken` примет заявку только со статусом «в работе/завершена» (`status_in_work_markers`/`status_done_markers`). Тест `SpaPlatformTest.test_confirm_requires_in_work_rejects_available_row` |

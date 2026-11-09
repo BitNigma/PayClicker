@@ -150,6 +150,16 @@ def _run_self_check() -> int:
         cfg.headless,
     )
     logger.info("Точка входа: %s", getattr(run_worker, "__module__", run_worker))
+    # Темп запросов: главный рычаг против 429/антибота (см. PayoutClient._throttle).
+    logger.info(
+        "Темп запросов: опрос %s-%s мс × %s воронок, общий лимит клиента %s мс "
+        "(после 429 пауза растёт до %s мс, Retry-After соблюдается)",
+        getattr(cfg, "take_poll_min_ms", "?"),
+        getattr(cfg, "take_poll_max_ms", "?"),
+        getattr(cfg, "take_parallel_pollers", "?"),
+        getattr(cfg, "http_min_interval_ms", 0),
+        getattr(cfg, "http_max_interval_ms", 5000),
+    )
     # Фильтры взятия — часть конфига, поэтому показываем их в --check: чаще всего
     # «бот не берёт заявки» объясняется именно ими (сумма вне диапазона, блок API).
     low = getattr(cfg, "min_sum", None)
@@ -165,6 +175,17 @@ def _run_self_check() -> int:
         else "не ограничена",
         ", ".join(getattr(cfg, "take_skip_markers", ()) or ()) or "выключен",
     )
+    # Как запускается работа — частая причина вопроса «почему ничего не происходит».
+    logger.info(
+        "Старт работы: воркеры спят до команды /run в Telegram; /start_session — "
+        "только вход. Браузер в режиме http разово нужен лишь при недействительной сессии."
+    )
+    if backend == "http" and getattr(cfg, "headless", False):
+        logger.warning(
+            "HEADLESS=true: окно разовой авторизации будет НЕВИДИМЫМ (горячий цикл "
+            "идёт по HTTP). Если Cloudflare не пропускает headless-вход — "
+            "поставьте HEADLESS=false, окно нужно только для входа."
+        )
     return 0
 
 
@@ -230,6 +251,12 @@ async def main():
             "Started %d worker task(s): %s",
             len(worker_tasks),
             [f"{a.index}:{a.name}" for a in accounts],
+        )
+        logger.info(
+            "Ждём /run в Telegram: /start_session — вход, /run — взятие заявок "
+            "(backend=%s, headless=%s)",
+            backend,
+            cfg.headless,
         )
 
         try:

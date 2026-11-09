@@ -175,11 +175,54 @@ CONFIRM_REQUIRES_IN_WORK=true
 DEMANDS_URL=https://911pay.net/trader/payouts/payout-list?page=1&per_page=50&tab=in-work
 ```
 
+Темп запросов (главное против 429/антибота; подробности — раздел ниже):
+
+```dotenv
+TAKE_POLL_MIN_MS=100      # 2 воронки по 60 мс давали ~20 req/s → 429
+TAKE_POLL_MAX_MS=200
+TAKE_PARALLEL_POLLERS=1
+HTTP_MIN_INTERVAL_MS=120  # общий лимит частоты на кабинет (все воронки + POST)
+HTTP_MAX_INTERVAL_MS=5000 # потолок адаптивной паузы после 429
+HTTP_RATE_LIMIT_COOLDOWN_S=3   # пауза при 429 без Retry-After
+HTTP_BLOCK_RETRIES=4      # сколько раз терпеть 403/challenge до реавторизации
+HTTP_BLOCK_BACKOFF_S=5    # пауза после 403: 5 → 10 → 20 … до 60 с
+```
+
 `parse_rows()` сам распознаёт Inertia JSON/`data-page` и переводит код статуса в
 текст, поэтому `STATUS_*_MARKERS` продолжают работать. `tab=in-work` для
 `DEMANDS_URL` — это ровно занятые слоты (маленькая страница), `tab=common`
 отдаёт все 70+ заявок (сотни КБ). Подтверждение при `CONFIRM_REQUIRES_IN_WORK=true`
 идёт только по статусу «в работе»: отменённая/истёкшая заявка не считается взятой.
+
+### Почему `python -m app.main` не открывает браузер (это норма)
+
+В режиме `WORKER_BACKEND=http` браузер во взятии заявок не участвует вообще:
+очередь и claim идут через httpx. Chromium поднимается ТОЛЬКО на разовую
+авторизацию и только когда сохранённая сессия (`data/auth.json`) недействительна.
+Поэтому после `python -m app.main` в логе видно:
+
+```text
+Started 1 worker task(s): 1:Кабинет 1
+Ждём /run в Telegram: /start_session — вход, /run — взятие заявок (backend=http, headless=True)
+[Кабинет 1] воркер готов и ждёт команду /run в Telegram (вход — /start_session; до команды запросов к сайту нет)
+```
+
+Дальше — в Telegram:
+
+- `/start_session` — вход (окно появится только при `HEADLESS=false`);
+- `/run` — взятие. Без этой команды воркеры спят и к сайту не ходят.
+
+Если сессия недействительна, а `HEADLESS=true`, окно входа невидимо, и Cloudflare
+на 911pay такой вход часто не пропускает — со стороны это выглядит как
+«авторизация не запускается». Для входа с окном:
+
+```bash
+HEADLESS=false python -m app.main     # или поправить .env и перезапустить бота
+```
+
+Горячий цикл при этом всё равно идёт по HTTP — окно нужно ровно на один вход.
+Видимое окно с кликом по кнопке «Взять» — это `python -m app.take_capture`
+(он всегда headful, независимо от `HEADLESS`).
 
 ⚠️ **Проверьте окружение терминала.** `load_dotenv()` НЕ перезаписывает уже
 экспортированные переменные, поэтому старые `TARGET_QUEUE_SIZE`/`DEMANDS_URL`/

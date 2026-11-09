@@ -1601,10 +1601,21 @@ async def run_worker(cfg: Config, account, ws, notify, notify_file):
         confirm_page = await context.new_page()     # быстрая проверка сразу после клика "взять"
         status_page = await context.new_page()       # раз в 30 сек проверяет статусы своей очереди
 
+        waiting_logged = False
         while True:
             if not ws.running:
+                # См. http_worker.run_worker: без этой строки запуск выглядит как
+                # «ничего не происходит».
+                if not waiting_logged:
+                    logger.info(
+                        "[%s] воркер готов и ждёт команду /run в Telegram "
+                        "(вход — /start_session)",
+                        account.name,
+                    )
+                    waiting_logged = True
                 await asyncio.sleep(1)
                 continue
+            waiting_logged = False
 
             if not ws.logged_in:
                 ok = await ensure_logged_in(page, context, cfg, account, ws, acct_notify, acct_notify_file)

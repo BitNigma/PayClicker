@@ -85,6 +85,42 @@ class SelfCheckTest(unittest.TestCase):
         self.assertIn("прокси=1", text)
 
 
+class SelfCheckStartHintTest(unittest.TestCase):
+    """--check объясняет: воркеры ждут /run, а headless скрывает окно входа.
+
+    Повод: `python -m app.main` не открывает браузер (в http-режиме он нужен
+    только для разового входа), и запуск выглядит как «ничего не происходит».
+    """
+
+    BASE = dict(
+        accounts=[SimpleNamespace(index=1, name="Кабинет 1")],
+        allowed_chat_ids=[111],
+        proxy_urls=[],
+        target_queue_size=8,
+    )
+
+    def _run_check(self, backend: str, headless: bool) -> str:
+        cfg = SimpleNamespace(headless=headless, **self.BASE)
+        with patch.object(main_module, "load_config", return_value=cfg), patch.object(
+            main_module, "_pick_worker", return_value=(lambda: None, backend)
+        ), self.assertLogs("main", level="INFO") as captured:
+            main_module._run_self_check()
+        return "\n".join(captured.output)
+
+    def test_hints_about_run_command(self):
+        text = self._run_check("http", headless=False)
+        self.assertIn("/run", text)
+        self.assertIn("/start_session", text)
+
+    def test_warns_about_invisible_auth_window(self):
+        text = self._run_check("http", headless=True)
+        self.assertIn("HEADLESS=true", text)
+        self.assertIn("НЕВИДИМЫМ", text)
+
+    def test_no_headless_warning_when_headless_false(self):
+        self.assertNotIn("НЕВИДИМЫМ", self._run_check("http", headless=False))
+
+
 class ShadowedEnvTest(unittest.TestCase):
     """`export TARGET_QUEUE_SIZE=10` в терминале тихо перекрывает .env (8).
 

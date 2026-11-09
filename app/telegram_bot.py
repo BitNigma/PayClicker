@@ -158,6 +158,12 @@ async def _apply_account_action(update: Update, cfg: Config, action: str, index)
         lines.insert(0, f"{_ACTION_TITLES.get(action, action)} — кабинетов: {len(indices)}")
 
     if need_login:
+        if getattr(cfg, "headless", False):
+            lines.append(
+                "⚠️ HEADLESS=true: окно входа не откроется — авторизация идёт невидимо. "
+                "Если Cloudflare её не пропускает, перезапустите бота с HEADLESS=false "
+                "(горячий цикл всё равно идёт по HTTP, окно нужно только для входа)."
+            )
         lines.append(
             "Если понадобится код 2FA — пришлите его сюда. Когда кода ждут несколько "
             "кабинетов, укажите номер и код через пробел (например: 2 123456)."
