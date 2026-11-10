@@ -80,7 +80,9 @@
    — потолок адаптивной паузы, `HTTP_RATE_LIMIT_COOLDOWN_S` — пауза при 429 без
    `Retry-After`, `HTTP_BLOCK_RETRIES`/`HTTP_BLOCK_BACKOFF_S` — сколько раз терпеть
    403/challenge паузами до сброса cookies. 429 → `RateLimited` (пауза, cookies
-   НЕ трогаем), 403 → `BlockedError` с терпением. Тесты — `tests/test_rate_limit.py`.
+   НЕ трогаем), 403 → `BlockedError` с терпением. Уведомления об этом в Telegram:
+   `NOTIFY_RATE_LIMIT` (по умолчанию true; false — только лог), интервал повторов
+   `RATE_NOTICE_GAP_S` (30 с). Тесты — `tests/test_rate_limit.py`.
 4. Прогнать тесты `SpaPlatformTest` в `tests/test_http_worker.py` (и
    `tests/test_inertia_spa.py` для Inertia) и снять дамп первой же страницы
    очереди (`DEBUG_CAPTURE_ATTEMPTS=true`), чтобы сверить маркеры с реальной

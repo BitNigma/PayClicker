@@ -9,6 +9,7 @@
     python -m unittest discover -s tests -t .
 """
 import asyncio
+import os
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -221,6 +222,11 @@ async def _noop_file(path: str, caption: str = "") -> None:
 class PollLoopRateLimitTest(unittest.TestCase):
     """429 в горячем цикле: пауза и продолжение, без сброса cookies/реавторизации."""
 
+    def setUp(self):
+        from app.http_worker import _RATE_NOTICE_AT
+
+        _RATE_NOTICE_AT.clear()
+
     def test_429_does_not_trigger_reauth(self):
         cfg = make_cfg()
         client = _FakeClient(cfg, [RateLimited(retry_after=0.05), "<html></html>"])
@@ -325,6 +331,97 @@ class ConfirmRateLimitTest(unittest.TestCase):
         ok = asyncio.run(_confirm_taken(client, cfg, "123", attempts=2, delay=0.01))
         self.assertTrue(ok)
         self.assertEqual(client.calls, 2)
+
+
+class RateNoticeToggleTest(unittest.TestCase):
+    """NOTIFY_RATE_LIMIT / RATE_NOTICE_GAP_S: уведомления о лимитах управляются из .env."""
+
+    def setUp(self):
+        from app.http_worker import _RATE_NOTICE_AT
+
+        _RATE_NOTICE_AT.clear()
+
+    def _run_poll(self, cfg: Config) -> list[str]:
+        client = _FakeClient(cfg, [RateLimited(retry_after=0.01), "<html></html>"])
+        ws = _ws()
+        messages: list[str] = []
+
+        async def notify(text: str) -> None:
+            messages.append(text)
+
+        asyncio.run(
+            _run_short(
+                _poll_loop(
+                    client, cfg, cfg.accounts[0], ws, notify, _noop_file,
+                    Metrics(cfg), set(), set(),
+                ),
+                seconds=0.3,
+            )
+        )
+        return messages
+
+    def test_notifications_can_be_disabled_from_env(self):
+        self.assertEqual(self._run_poll(make_cfg(notify_rate_limit=False)), [])
+
+    def test_notifications_are_sent_by_default(self):
+        messages = self._run_poll(make_cfg())
+        self.assertTrue(any("ограничил частоту" in m for m in messages), messages)
+
+    def test_gap_suppresses_repeats(self):
+        cfg = make_cfg(rate_notice_gap_s=3600)
+        client = _FakeClient(cfg, [RateLimited(retry_after=0.01)] * 5)
+        ws = _ws()
+        messages: list[str] = []
+
+        async def notify(text: str) -> None:
+            messages.append(text)
+
+        asyncio.run(
+            _run_short(
+                _poll_loop(
+                    client, cfg, cfg.accounts[0], ws, notify, _noop_file,
+                    Metrics(cfg), set(), set(),
+                ),
+                seconds=0.3,
+            )
+        )
+        rate_messages = [m for m in messages if "ограничил частоту" in m]
+        self.assertEqual(len(rate_messages), 1, messages)
+
+
+class RateNoticeConfigTest(unittest.TestCase):
+    """Поля конфига: NOTIFY_RATE_LIMIT (по умолчанию true) и RATE_NOTICE_GAP_S."""
+
+    BASE_ENV = {
+        "TELEGRAM_BOT_TOKEN": "t",
+        "TELEGRAM_ALLOWED_CHAT_ID": "1",
+        "SITE_LOGIN": "a@b.c",
+        "SITE_PASSWORD": "p",
+        "SITE_URL": "https://x/signin",
+        "QUEUE_URL": "https://x/queue",
+        "DEMANDS_URL": "https://x/demands",
+    }
+
+    def test_defaults(self):
+        from unittest.mock import patch
+
+        from app.config import load_config
+
+        with patch.dict(os.environ, self.BASE_ENV, clear=True):
+            cfg = load_config()
+        self.assertTrue(cfg.notify_rate_limit)
+        self.assertEqual(cfg.rate_notice_gap_s, 30.0)
+
+    def test_disabled_and_custom_gap(self):
+        from unittest.mock import patch
+
+        from app.config import load_config
+
+        env = dict(self.BASE_ENV, NOTIFY_RATE_LIMIT="false", RATE_NOTICE_GAP_S="600")
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+        self.assertFalse(cfg.notify_rate_limit)
+        self.assertEqual(cfg.rate_notice_gap_s, 600.0)
 
 
 if __name__ == "__main__":

@@ -110,10 +110,20 @@ RATE_NOTICE_GAP_S = 30.0
 _RATE_NOTICE_AT: dict[str, float] = {}
 
 
-async def _notify_rate_limit(notify, name: str, text: str) -> None:
-    """Сообщение о лимите/блокировке с защитой от повторов."""
+async def _notify_rate_limit(notify, name: str, text: str, cfg=None) -> None:
+    """Сообщение о лимите/блокировке с защитой от повторов.
+
+    Отключается через NOTIFY_RATE_LIMIT=false: предупреждение остаётся только в
+    логе (logger.warning рядом), в Telegram не уходит. Интервал повторов —
+    RATE_NOTICE_GAP_S (по умолчанию 30 с).
+    """
+    if cfg is not None and not getattr(cfg, "notify_rate_limit", True):
+        return
+    gap = RATE_NOTICE_GAP_S
+    if cfg is not None:
+        gap = float(getattr(cfg, "rate_notice_gap_s", RATE_NOTICE_GAP_S) or 0.0)
     now = time.monotonic()
-    if now - _RATE_NOTICE_AT.get(name, 0.0) < RATE_NOTICE_GAP_S:
+    if now - _RATE_NOTICE_AT.get(name, 0.0) < gap:
         return
     _RATE_NOTICE_AT[name] = now
     await notify(text)
@@ -1339,6 +1349,7 @@ async def _do_take(
                     notify, account.name,
                     f"⏳ Взятие: сайт ограничил частоту (HTTP {exc.status}), "
                     f"пауза {wait:.0f} с.",
+                    cfg,
                 )
                 await asyncio.sleep(min(wait, 30.0))
                 return False
@@ -1579,6 +1590,7 @@ async def watch_loop(
                 notify, account.name,
                 f"⏳ Наблюдение: сайт ограничил частоту (HTTP {exc.status}), "
                 f"пауза {wait:.0f} с. Cookies в порядке, продолжаю.",
+                cfg,
             )
             await asyncio.sleep(wait)
             continue
@@ -1599,6 +1611,7 @@ async def watch_loop(
                     notify, account.name,
                     f"⏳ Наблюдение: антибот-заглушка (попытка {block_streak}/{tries}), "
                     f"пауза {delay:.0f} с. Cookies не сбрасываю.",
+                    cfg,
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -1908,6 +1921,7 @@ async def _poll_loop(
                 f"⏳ Сайт ограничил частоту запросов (HTTP {exc.status}). "
                 f"Пауза {wait:.0f} с, темп снижен. Cookies в порядке — "
                 "авторизация не нужна, взятие продолжается.",
+                cfg,
             )
             await asyncio.sleep(wait)
             continue
@@ -1929,6 +1943,7 @@ async def _poll_loop(
                     f"⏳ Сайт отдал антибот-заглушку (попытка {block_streak}/{tries}). "
                     f"Пауза {delay:.0f} с, cookies не сбрасываю — если не поможет, "
                     "переавторизуюсь автоматически.",
+                    cfg,
                 )
                 await asyncio.sleep(delay)
                 continue

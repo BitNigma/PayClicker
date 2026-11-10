@@ -145,6 +145,11 @@ class Config:
     http_block_retries: int = 3
     # Базовая пауза перед повтором после 403/challenge, сек (растёт экспоненциально).
     http_block_backoff_s: float = 5.0
+    # Присылать ли в Telegram предупреждения о лимитах/антиботе (429/403).
+    # false — они остаются только в логе (консоль), в чат не идут; взятие работает.
+    notify_rate_limit: bool = True
+    # Минимальный интервал между такими предупреждениями, сек (анти-спам).
+    rate_notice_gap_s: float = 30.0
 
     # --- Профиль площадки: разметка HTML и эндпоинт взятия ---
     # Значения по умолчанию = текущая площадка (spark-trading.cash): серверные
@@ -448,6 +453,9 @@ def load_config() -> Config:
         ),
         http_block_retries=max(0, int(env.get("HTTP_BLOCK_RETRIES", "3"))),
         http_block_backoff_s=max(0.0, float(env.get("HTTP_BLOCK_BACKOFF_S", "5"))),
+        # Уведомления о лимитах/антиботе в Telegram (лог остаётся всегда).
+        notify_rate_limit=env.get("NOTIFY_RATE_LIMIT", "true").lower() == "true",
+        rate_notice_gap_s=max(0.0, float(env.get("RATE_NOTICE_GAP_S", "30"))),
         # --- Профиль площадки (разметка/эндпоинты). Пусто/не задано — дефолты Config.
         site_host=(env.get("SITE_HOST") or "spark-trading.cash"),
         signin_path=(env.get("SIGNIN_PATH") or "/signin"),
